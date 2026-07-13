@@ -224,7 +224,17 @@ call asks for more GPU-seconds than a free account may request at once.
 - **n8n** 1.60.0 or later
 - **Node.js** 20.15 or later
 
-Tested against n8n 1.x. The node has **zero runtime dependencies**.
+Tested against n8n 1.x.
+
+### Dependencies
+
+The node has **zero runtime dependencies** — `npm audit --omit=dev` reports no
+vulnerabilities, because nothing is shipped but the compiled node itself.
+
+A plain `npm audit` does report advisories. Every one of them comes from
+`n8n-workflow`, which is a **peer** dependency: n8n supplies it at runtime from its
+own tree, so those advisories are resolved by upgrading n8n, not this package.
+Pinning our own copy would only risk breaking compatibility with the host.
 
 ## Resources
 
