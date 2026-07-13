@@ -1,0 +1,79 @@
+{
+  "name": "n8n-nodes-huggingface-space",
+  "version": "1.0.0",
+  "description": "Run inference on any Hugging Face Gradio Space from n8n — images, text, video, music, speech, moderation and more, with a curated model catalog and automatic fallbacks.",
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "huggingface",
+    "hugging-face",
+    "gradio",
+    "ai",
+    "text-to-image",
+    "text-to-video",
+    "text-to-music",
+    "text-to-speech",
+    "llm",
+    "moderation",
+    "flux",
+    "stable-diffusion"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/shadow-software/n8n-nodes-huggingface-space",
+  "author": {
+    "name": "Shadow Software",
+    "email": "info@shadowsoftware.com",
+    "url": "https://shadowsoftware.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shadow-software/n8n-nodes-huggingface-space.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shadow-software/n8n-nodes-huggingface-space/issues"
+  },
+  "engines": {
+    "node": ">=20.15"
+  },
+  "main": "index.js",
+  "scripts": {
+    "build": "npx rimraf dist && tsc && gulp build:icons",
+    "dev": "tsc --watch",
+    "format": "prettier nodes credentials --write",
+    "lint": "eslint nodes credentials package.json",
+    "lintfix": "eslint nodes credentials package.json --fix",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "prepublishOnly": "npm run build && npm run lint && npm run test"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/HuggingFaceSpaceApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/HuggingFaceSpace/HuggingFaceSpace.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.15.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "eslint": "^8.57.0",
+    "eslint-plugin-n8n-nodes-base": "^1.16.3",
+    "gulp": "^5.0.0",
+    "jsonc-eslint-parser": "^2.4.2",
+    "n8n-workflow": "*",
+    "prettier": "^3.3.2",
+    "rimraf": "^5.0.7",
+    "typescript": "^5.5.3",
+    "vitest": "^2.1.9"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  }
+}
