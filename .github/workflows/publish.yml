@@ -12,9 +12,18 @@ name: Publish to npm
 # No NPM_TOKEN secret is needed — Trusted Publishing exchanges the OIDC token.
 
 on:
+  # Auto-deploy on push to the default branch. A `v*` tag still works too (and is
+  # what a manual `npm version` produces), but you don't NEED to tag: just bump the
+  # version in package.json and push.
   push:
+    branches: [main, master]
     tags:
       - 'v*'
+    paths:
+      - 'nodes/**'
+      - 'credentials/**'
+      - 'package.json'
+      - '.github/workflows/publish.yml'
   workflow_dispatch:
 
 permissions:
@@ -22,7 +31,40 @@ permissions:
   id-token: write # required to mint the provenance attestation
 
 jobs:
+  # Publishing a version that already exists is a hard npm error, so a branch push
+  # must only publish when the version in package.json actually CHANGED. This gate
+  # diffs package.json against the previous commit; a normal push (docs, a fix
+  # without a bump) is a clean no-op, and bumping the version is what ships.
+  # A tag push always publishes (the version was bumped to create it).
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.decide.outputs.should_publish }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # need the previous commit to diff the version
+      - id: decide
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag push -> publish v$version"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          prev="$(git show HEAD~1:package.json 2>/dev/null | node -pe 'JSON.parse(require("fs").readFileSync(0)).version' 2>/dev/null || echo none)"
+          if [[ "$version" != "$prev" ]]; then
+            echo "version changed $prev -> $version -> publish"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version unchanged ($version) -> nothing to publish"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
   publish:
+    needs: check
+    if: ${{ needs.check.outputs.should_publish == 'true' }}
     runs-on: ubuntu-latest
 
     # Hoisted to the JOB so the org-grant step's `if:` can read it. The `secrets`
