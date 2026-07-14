@@ -215,6 +215,49 @@ describe('catalog integrity', () => {
 	});
 });
 
+describe('catalog: knownExtras integrity', () => {
+	// The node namespaces each field's n8n parameter name as `known_<model.value>_<extra.name>`
+	// (see knownExtraFieldName in HuggingFaceSpace.node.ts) specifically because model
+	// values are relied on here to be globally unique across the WHOLE catalog, not just
+	// within one category — a duplicate would make two different models' fields collide
+	// onto the same n8n parameter.
+	test('every model value is globally unique across all categories', () => {
+		const values = CATEGORIES.flatMap((cat) => cat.models.map((m) => m.value));
+		expect(new Set(values).size, 'duplicate model value across categories').toBe(values.length);
+	});
+
+	test('every knownExtras entry has a non-empty name and displayName, unique within its model', () => {
+		for (const cat of CATEGORIES) {
+			for (const m of cat.models) {
+				if (!m.knownExtras?.length) continue;
+				const names = m.knownExtras.map((e) => e.name);
+				expect(new Set(names).size, `duplicate knownExtras name on ${m.value}`).toBe(names.length);
+				for (const extra of m.knownExtras) {
+					expect(extra.name, `${m.value} knownExtras name`).toBeTruthy();
+					expect(extra.displayName, `${m.value}/${extra.name} displayName`).toBeTruthy();
+					expect(extra.description, `${m.value}/${extra.name} description`).toBeTruthy();
+				}
+			}
+		}
+	});
+
+	// mirrorAs exists so one field can populate two Spaces' differently-named
+	// parameters (see face-swap-cpu). A mirror name equal to the field's own name
+	// would send the same value twice under one key, which is just a no-op typo.
+	test('mirrorAs never repeats the field\'s own parameter name', () => {
+		for (const cat of CATEGORIES) {
+			for (const m of cat.models) {
+				for (const extra of m.knownExtras ?? []) {
+					for (const alias of extra.mirrorAs ?? []) {
+						expect(alias, `${m.value}/${extra.name} mirrorAs`).not.toBe(extra.name);
+					}
+				}
+			}
+		}
+	});
+
+});
+
 describe('catalog: per-Space defaults', () => {
   // Some Spaces need a non-prompt argument or they refuse the call outright.
   // Lightricks/ltx-video-distilled defaults `mode` to image-to-video, so even on

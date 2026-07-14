@@ -3,10 +3,14 @@ import {
 	ILoadOptionsFunctions,
 	INode,
 	INodeExecutionData,
+	INodeProperties,
 	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
 	NodeOperationError,
+	type FieldType,
+	type ResourceMapperField,
+	type ResourceMapperFields,
 } from 'n8n-workflow';
 
 import {
@@ -19,6 +23,7 @@ import {
 	spaceToHost,
 	type Fetcher,
 	type GradioEndpointParameter,
+	type GradioInfo,
 	type PredictResult,
 } from './GradioClient';
 
@@ -27,8 +32,74 @@ import {
 	getModel,
 	modelDescription,
 	modelLabel,
+	type CatalogModel,
 	type CatalogSpace,
 } from './catalog';
+
+/**
+ * The node-parameter name for a model's known-extra field. Namespaced by model
+ * value (globally unique across the catalog) so two models reusing the same
+ * Gradio parameter name (e.g. `image`) never collide as n8n parameters.
+ */
+function knownExtraFieldName(modelValue: string, extraName: string): string {
+	return `known_${modelValue}_${extraName}`;
+}
+
+/**
+ * One real INodeProperties field per model-specific known extra (see KnownExtra
+ * in catalog.ts), gated to show only when that exact category + model is
+ * selected in Catalog mode — the same displayOptions pattern already used for
+ * the per-category model dropdown above.
+ */
+function buildKnownExtraProperties(): INodeProperties[] {
+	const fields: INodeProperties[] = [];
+	for (const cat of CATEGORIES) {
+		for (const model of cat.models) {
+			for (const extra of model.knownExtras ?? []) {
+				fields.push({
+					displayName: extra.displayName,
+					name: knownExtraFieldName(model.value, extra.name),
+					type: extra.type,
+					...(extra.multiline ? { typeOptions: { rows: 4 } } : {}),
+					displayOptions: {
+						show: { source: ['catalog'], category: [cat.value], [`model_${cat.value}`]: [model.value] },
+					},
+					default: extra.default,
+					...(extra.required ? { required: true } : {}),
+					description: extra.description,
+				} as INodeProperties);
+			}
+		}
+	}
+	return fields;
+}
+
+/**
+ * Read every known-extra field for the given model out of the node parameters
+ * and return them as a plain name -> value map, ready to merge into `provided`
+ * alongside the sentinel prompt and Extra Parameters overrides.
+ *
+ * mirrorAs fans a single field's value out to additional Gradio parameter names
+ * (see KnownExtra) — needed because some models' fallback Spaces name the same
+ * argument differently.
+ */
+function readKnownExtras(
+	ctx: IExecuteFunctions,
+	model: CatalogModel,
+	itemIndex: number,
+): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const extra of model.knownExtras ?? []) {
+		const fieldName = knownExtraFieldName(model.value, extra.name);
+		const value = ctx.getNodeParameter(fieldName, itemIndex, extra.default);
+		// An empty optional string is "not set" — don't send it and override a
+		// Space's own default with an empty value.
+		if (value === '' && !extra.required) continue;
+		out[extra.name] = value;
+		for (const alias of extra.mirrorAs ?? []) out[alias] = value;
+	}
+	return out;
+}
 
 /**
  * Hugging Face Space (Gradio) — call any free Gradio Space from n8n.
@@ -49,7 +120,7 @@ export class HuggingFaceSpace implements INodeType {
 		group: ['transform'],
 		version: 1,
 		subtitle:
-			'={{$parameter["source"] === "custom" ? $parameter["space"] + " → /" + ($parameter["apiName"] || "?") : $parameter["category"] + ": " + $parameter["model_" + $parameter["category"]]}}',
+			'={{$parameter["source"] === "custom" ? $parameter["space"] + " → /" + ($parameter["apiName"]["value"] || "?") : $parameter["category"] + ": " + $parameter["model_" + $parameter["category"]]}}',
 		description:
 			'Run inference on a free Hugging Face Gradio Space (FLUX.2, Qwen-Image, Stable Diffusion 3.5, Z-Image-Turbo, …)',
 		defaults: {
@@ -121,6 +192,11 @@ export class HuggingFaceSpace implements INodeType {
 				placeholder: 'A modern flat illustration of AI writing a blog article',
 				description: 'The text prompt. Mapped to whichever parameter the chosen Space expects.',
 			},
+			// One real field per model-specific required/common argument (Seed-VC's two
+			// audio clips, ACE-Step's lyrics, etc.), gated to that exact model — see
+			// KnownExtra in catalog.ts. This replaces having to read a model's `note`
+			// and hand-type a parameter name into Extra Parameters below.
+			...buildKnownExtraProperties(),
 			{
 				displayName: 'Extra Parameters',
 				name: 'catalogExtras',
@@ -130,7 +206,7 @@ export class HuggingFaceSpace implements INodeType {
 				default: {},
 				displayOptions: { show: { source: ['catalog'] } },
 				description:
-					'Optional overrides passed to the Space by name (e.g. width, height, num_inference_steps). Anything omitted uses the Space\'s own default.',
+					'Uncommon overrides passed to the Space by name (e.g. width, height, num_inference_steps), for anything not already covered by a field above. Anything omitted uses the Space\'s own default.',
 				options: [
 					{
 						name: 'parameter',
@@ -154,18 +230,32 @@ export class HuggingFaceSpace implements INodeType {
 					'Space ID as "owner/name" (from the Spaces directory URL), or a full https://…hf.space URL',
 			},
 			{
-				displayName: 'API Endpoint Name or ID',
+				displayName: 'API Endpoint',
 				name: 'apiName',
-				type: 'options',
-				typeOptions: {
-					loadOptionsMethod: 'getApiEndpoints',
-					loadOptionsDependsOn: ['space'],
-				},
-				default: '',
+				type: 'resourceLocator',
+				default: { mode: 'list', value: '' },
 				required: true,
 				displayOptions: { show: { source: ['custom'] } },
 				description:
-					'Which of the Space\'s API endpoints to call (the "api_name" in its API docs, e.g. /infer or /generate). Choose from the list, loaded live from the Space. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
+					'Which of the Space\'s API endpoints to call (the "api_name" in its API docs, e.g. /infer or /generate)',
+				modes: [
+					{
+						displayName: 'From List',
+						name: 'list',
+						type: 'list',
+						typeOptions: {
+							searchListMethod: 'searchApiEndpoints',
+							searchable: true,
+						},
+					},
+					{
+						displayName: 'Name',
+						name: 'id',
+						type: 'string',
+						hint: 'Enter the api_name exactly as shown in the Space\'s "Use via API" docs',
+						placeholder: 'infer',
+					},
+				],
 			},
 			{
 				displayName: 'Send Parameters As',
@@ -190,36 +280,23 @@ export class HuggingFaceSpace implements INodeType {
 			{
 				displayName: 'Parameters',
 				name: 'namedParameters',
-				type: 'fixedCollection',
-				typeOptions: { multipleValues: true },
-				placeholder: 'Add Parameter',
-				default: {},
+				type: 'resourceMapper',
+				default: { mappingMode: 'defineBelow', value: null },
+				noDataExpression: true,
 				displayOptions: { show: { source: ['custom'], inputMode: ['named'] } },
 				description:
-					'Arguments by name (e.g. prompt, width, height). Anything omitted uses the Space\'s declared default.',
-				options: [
-					{
-						name: 'parameter',
-						displayName: 'Parameter',
-						values: [
-							{
-								displayName: 'Name',
-								name: 'name',
-								type: 'string',
-								default: '',
-								placeholder: 'prompt',
-							},
-							{
-								displayName: 'Value',
-								name: 'value',
-								type: 'string',
-								default: '',
-								description:
-									'Value to send. Numbers, booleans, and JSON arrays/objects are parsed automatically.',
-							},
-						],
+					'Arguments by name, one real field per parameter the Space\'s own /info schema declares. Anything left blank uses the Space\'s declared default.',
+				typeOptions: {
+					resourceMapper: {
+						resourceMapperMethod: 'getGradioParameters',
+						mode: 'add',
+						fieldWords: { singular: 'parameter', plural: 'parameters' },
+						addAllFields: true,
+						supportAutoMap: false,
+						noFieldsError:
+							'This endpoint declares no parameters — nothing to map. Some Spaces still expect a single unnamed argument; use Positional Array instead.',
 					},
-				],
+				},
 			},
 			{
 				displayName: 'Positional Arguments (JSON Array)',
@@ -282,20 +359,21 @@ export class HuggingFaceSpace implements INodeType {
 	};
 
 	methods = {
-		loadOptions: {
-			async getApiEndpoints(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+		listSearch: {
+			/**
+			 * Backs the API Endpoint resourceLocator's "From List" mode. Reads the
+			 * Space's own /info schema live, so the list is always this exact Space's
+			 * real endpoints — never a guess at naming.
+			 */
+			async searchApiEndpoints(
+				this: ILoadOptionsFunctions,
+				filter?: string,
+			): Promise<{ results: INodePropertyOptions[] }> {
 				const space = this.getNodeParameter('space', '') as string;
-				if (!space || !space.trim()) return [];
+				if (!space || !space.trim()) return { results: [] };
 
-				const token = await getToken(this);
-				const fetcher = makeFetcher();
-				const host = spaceToHost(space);
-
-				const config = await fetchConfig(host, fetcher, token);
-				const info = await fetchInfo(host, config.api_prefix ?? '', fetcher, token);
-				const named = info.named_endpoints ?? {};
-
-				return Object.entries(named).map(([name, ep]) => {
+				const named = await fetchNamedEndpoints(this, space);
+				const results = Object.entries(named).map(([name, ep]) => {
 					const params = (ep.parameters ?? [])
 						.map((p) => p.parameter_name)
 						.filter(Boolean)
@@ -306,6 +384,52 @@ export class HuggingFaceSpace implements INodeType {
 						description: params ? `(${params})` : 'no parameters',
 					};
 				});
+				if (!filter) return { results };
+				const needle = filter.toLowerCase();
+				return { results: results.filter((r) => r.name.toLowerCase().includes(needle)) };
+			},
+		},
+		resourceMapper: {
+			/**
+			 * Backs the Parameters resourceMapper for Custom Space mode. Turns the
+			 * selected endpoint's live /info schema into one real field per Gradio
+			 * parameter, prefilled with that parameter's own declared default so the
+			 * user sees what the Space would use if they leave it blank.
+			 */
+			async getGradioParameters(this: ILoadOptionsFunctions): Promise<ResourceMapperFields> {
+				const space = this.getNodeParameter('space', '') as string;
+				const apiNameLocator = this.getNodeParameter('apiName', {
+					mode: 'list',
+					value: '',
+				}) as { mode: string; value: string };
+				const apiName = String(apiNameLocator?.value ?? '').trim();
+				if (!space || !space.trim() || !apiName) return { fields: [] };
+
+				const named = await fetchNamedEndpoints(this, space);
+				const endpoint = named[`/${apiName}`] ?? named[apiName];
+				if (!endpoint) return { fields: [] };
+
+				const fields: ResourceMapperField[] = (endpoint.parameters ?? [])
+					.map((p) => p.parameter_name)
+					.filter((name): name is string => Boolean(name))
+					.map((name) => {
+						const param = endpoint.parameters?.find((p) => p.parameter_name === name);
+						return {
+							id: name,
+							displayName: name,
+							type: gradioTypeToFieldType(param),
+							required: !param?.parameter_has_default,
+							display: true,
+							defaultMatch: false,
+							canBeUsedToMatch: false,
+							defaultValue:
+								param?.parameter_has_default && isPrimitive(param.parameter_default)
+									? (param.parameter_default as string | number | boolean | null)
+									: null,
+						};
+					});
+
+				return { fields };
 			},
 		},
 	};
@@ -336,6 +460,8 @@ export class HuggingFaceSpace implements INodeType {
 				/** Set only in custom+positional mode, where the user supplies the raw array. */
 				let positional: unknown[] | undefined;
 				let modelName = '';
+				/** Set only in custom+named mode. See its assignment below for what it guards. */
+				let requireAllParams = false;
 
 				if (source === 'catalog') {
 					const category = this.getNodeParameter('category', itemIndex, 'image') as string;
@@ -365,6 +491,11 @@ export class HuggingFaceSpace implements INodeType {
 						throw new NodeOperationError(this.getNode(), 'Prompt cannot be empty', { itemIndex });
 					}
 
+					// Model-specific dedicated fields go first, so a caller's own Extra
+					// Parameters entry can still override one by name if they intentionally
+					// duplicate it.
+					Object.assign(provided, readKnownExtras(this, model, itemIndex));
+
 					for (const entry of readParameterCollection(
 						this.getNode(),
 						this.getNodeParameter('catalogExtras', itemIndex, {}),
@@ -381,14 +512,18 @@ export class HuggingFaceSpace implements INodeType {
 					candidates = useFallbacks ? model.spaces : [model.spaces[0]];
 				} else {
 					const space = (this.getNodeParameter('space', itemIndex, '') as string).trim();
-					const apiName = (this.getNodeParameter('apiName', itemIndex, '') as string).trim();
+					const apiNameLocator = this.getNodeParameter('apiName', itemIndex, {
+						mode: 'list',
+						value: '',
+					}) as { mode: string; value: string };
+					const apiName = String(apiNameLocator.value ?? '').trim();
 					const inputMode = this.getNodeParameter('inputMode', itemIndex, 'named') as string;
 
 					if (!space) {
 						throw new NodeOperationError(this.getNode(), 'Space cannot be empty', { itemIndex });
 					}
 					if (!apiName) {
-						throw new NodeOperationError(this.getNode(), 'API endpoint name cannot be empty', {
+						throw new NodeOperationError(this.getNode(), 'API endpoint cannot be empty', {
 							itemIndex,
 						});
 					}
@@ -405,14 +540,20 @@ export class HuggingFaceSpace implements INodeType {
 						}
 						positional = parsed;
 					} else {
-						for (const entry of readParameterCollection(
-							this.getNode(),
-							this.getNodeParameter('namedParameters', itemIndex, {}),
-							'Parameters',
-							itemIndex,
-						)) {
-							provided[entry.name] = coerce(entry.value);
+						const mapped = this.getNodeParameter('namedParameters.value', itemIndex, {}) as Record<
+							string,
+							string | number | boolean | null
+						>;
+						for (const [name, value] of Object.entries(mapped ?? {})) {
+							if (value === null || value === '') continue;
+							provided[name] = value;
 						}
+						// `requireAllParams` tells runWithFallbacks to check the LIVE /info schema
+						// (already fetched there) for any parameter with no declared default that
+						// is missing from `provided`, and fail loudly rather than let it silently
+						// fall through to the Space's own default/demo fixture. See the flag's
+						// definition for the full incident this guards against.
+						requireAllParams = true;
 					}
 					candidates = [{ space, api: apiName, promptParam: '' }];
 				}
@@ -426,6 +567,7 @@ export class HuggingFaceSpace implements INodeType {
 					// Only catalog mode walks a chain of differing schemas; in custom
 					// mode an unknown parameter name is a typo and should still throw.
 					dropUnknownParams: source === 'catalog',
+					requireAllParams,
 					token,
 					fetcher,
 					timeoutMs: timeout * 1000,
@@ -508,6 +650,18 @@ interface FallbackRun {
 	 * In custom mode there is no chain, so an unknown name IS a typo and must throw.
 	 */
 	dropUnknownParams?: boolean;
+	/**
+	 * Custom+named mode only: fail loudly if the candidate's OWN live schema
+	 * declares a parameter with no default and `provided` has no value for it,
+	 * instead of silently omitting it and letting Gradio fall back to whatever
+	 * default it has (sometimes a hardcoded demo fixture, not an empty value).
+	 *
+	 * Catalog mode never sets this: its prompt is always injected via the
+	 * `__prompt__` sentinel below, and its knownExtras fields already carry
+	 * `required: true` at the n8n property level, so the equivalent gap does not
+	 * exist there the same way.
+	 */
+	requireAllParams?: boolean;
 	token?: string;
 	fetcher: Fetcher;
 	timeoutMs: number;
@@ -570,29 +724,39 @@ async function runWithFallbacks(opts: FallbackRun): Promise<{
 				// Per-Space required args go on FIRST, so anything the caller supplied
 				// overrides them — a default is a floor, never a ceiling.
 				const args = { ...(candidate.defaults ?? {}), ...provided };
-				// Remap the prompt sentinel onto whatever this Space calls its prompt.
-				// Spaces rename and reorder parameters between versions, so trust the
-				// live schema over the catalog's recorded name: prefer the catalog's
-				// promptParam only if the Space still declares it, else fall back to a
-				// parameter literally named "prompt", else the first parameter.
 				if ('__prompt__' in args) {
 					const value = args.__prompt__;
 					delete args.__prompt__;
-					const names = params.map((p) => p.parameter_name).filter(Boolean) as string[];
-					const target =
-						(candidate.promptParam && names.includes(candidate.promptParam)
-							? candidate.promptParam
-							: undefined) ??
-						names.find((n) => n === 'prompt') ??
-						names[0];
-					if (!target) {
-						throw new NodeOperationError(
-							opts.node,
-							`Space ${candidate.space} /${api} declares no parameters, so there is nowhere to put the prompt`,
-							{ itemIndex },
-						);
+
+					// File-driven models (face swap, lipsync, voice conversion, …) declare
+					// promptParam: '' — the catalog's explicit statement that this Space
+					// takes no text prompt at all. Falling through to "first declared
+					// parameter" would silently overwrite that Space's first real argument
+					// (e.g. face-swap's sourceImage) with the node's Prompt field, which for
+					// these models is empty/irrelevant — so just drop the sentinel.
+					//
+					// Otherwise, remap it onto whatever this Space calls its prompt. Spaces
+					// rename and reorder parameters between versions, so trust the live
+					// schema over the catalog's recorded name: prefer the catalog's
+					// promptParam only if the Space still declares it, else fall back to a
+					// parameter literally named "prompt", else the first parameter.
+					if (candidate.promptParam !== '') {
+						const names = params.map((p) => p.parameter_name).filter(Boolean) as string[];
+						const target =
+							(candidate.promptParam && names.includes(candidate.promptParam)
+								? candidate.promptParam
+								: undefined) ??
+							names.find((n) => n === 'prompt') ??
+							names[0];
+						if (!target) {
+							throw new NodeOperationError(
+								opts.node,
+								`Space ${candidate.space} /${api} declares no parameters, so there is nowhere to put the prompt`,
+								{ itemIndex },
+							);
+						}
+						args[target] = value;
 					}
-					args[target] = value;
 				}
 
 				if (opts.dropUnknownParams) {
@@ -605,7 +769,28 @@ async function runWithFallbacks(opts: FallbackRun): Promise<{
 					}
 				}
 
+				// buildPositionalData() throws its OWN "unknown parameter" error for any key
+				// in `args` it doesn't recognize (custom mode never sets dropUnknownParams, so
+				// that check only happens here) — let that specific, more-actionable error win
+				// over the required-param check below when both would otherwise fire.
 				data = buildPositionalData(params, args);
+
+				if (opts.requireAllParams) {
+					const missing = params
+						.filter((p) => !p.parameter_has_default)
+						.map((p) => p.parameter_name)
+						.filter((name): name is string => Boolean(name))
+						.filter((name) => args[name] === undefined || args[name] === null || args[name] === '');
+					if (missing.length) {
+						throw new NodeOperationError(
+							opts.node,
+							`Required parameter(s) not set: ${missing.join(', ')}. Leaving a required ` +
+								`parameter blank sends no value at all for it — the Space may silently fall ` +
+								`back to its own default or demo output instead of erroring.`,
+							{ itemIndex },
+						);
+					}
+				}
 			}
 
 			const result = await predict({
@@ -817,13 +1002,58 @@ export function describeError(err: unknown): string {
 async function getToken(ctx: IExecuteFunctions | ILoadOptionsFunctions): Promise<string | undefined> {
 	try {
 		const cred = await ctx.getCredentials('huggingFaceSpaceApi');
-		const token = (cred?.apiKey ?? '') as string;
+		const token = (cred?.accessToken ?? '') as string;
 		return token ? token : undefined;
 	} catch {
 		// No credential attached — anonymous access. Free Spaces allow this, but
 		// ZeroGPU quota is much tighter, so calls may fail with an empty gr.Error.
 		return undefined;
 	}
+}
+
+/** A Space's declared endpoints, keyed by "/api_name" — the shape of GradioInfo.named_endpoints. */
+type NamedEndpoints = NonNullable<GradioInfo['named_endpoints']>;
+
+/**
+ * Fetch the given Space's /config + /info and return its named endpoints —
+ * shared by the API Endpoint list search and the Parameters resourceMapper, so
+ * both read the exact same live schema rather than two slightly different
+ * implementations drifting apart.
+ */
+async function fetchNamedEndpoints(ctx: ILoadOptionsFunctions, space: string): Promise<NamedEndpoints> {
+	const token = await getToken(ctx);
+	const fetcher = makeFetcher();
+	const host = spaceToHost(space);
+
+	const config = await fetchConfig(host, fetcher, token);
+	const info = await fetchInfo(host, config.api_prefix ?? '', fetcher, token);
+	return info.named_endpoints ?? {};
+}
+
+/**
+ * Narrow a Gradio parameter's declared type to one of resourceMapper's FieldType
+ * values. Many real Spaces' /info responses omit python_type/type entirely (the
+ * declared-type strings are optional in Gradio's own schema) — when that's blank,
+ * fall back to the JS type of the parameter's own default value, which is present
+ * far more often and is still a genuine signal (a numeric default means a numeric
+ * parameter).
+ */
+function gradioTypeToFieldType(param: GradioEndpointParameter | undefined): FieldType {
+	const t = (param?.python_type?.type ?? param?.type?.type ?? '').toLowerCase();
+	if (t.includes('bool')) return 'boolean';
+	if (t.includes('int') || t.includes('float') || t.includes('number')) return 'number';
+	if (t) return 'string';
+
+	if (param?.parameter_has_default) {
+		const d = param.parameter_default;
+		if (typeof d === 'boolean') return 'boolean';
+		if (typeof d === 'number') return 'number';
+	}
+	return 'string';
+}
+
+function isPrimitive(value: unknown): value is string | number | boolean | null {
+	return value === null || ['string', 'number', 'boolean'].includes(typeof value);
 }
 
 /**

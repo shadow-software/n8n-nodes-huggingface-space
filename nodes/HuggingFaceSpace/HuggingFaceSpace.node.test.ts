@@ -105,9 +105,22 @@ function makeCtx(opts: {
 	const items = opts.items ?? [{ json: {} }];
 	return {
 		getInputData: () => items,
-		getNodeParameter: vi.fn((name: string, _i: number, dflt: unknown) =>
-			name in opts.params ? opts.params[name] : dflt,
-		),
+		// Real n8n resolves dotted paths against nested parameter values (e.g.
+		// resourceMapper's `namedParameters.value`) — mirror that here rather than
+		// only supporting exact top-level keys.
+		getNodeParameter: vi.fn((name: string, _i: number, dflt: unknown) => {
+			if (name in opts.params) return opts.params[name];
+			const [head, ...rest] = name.split('.');
+			if (head in opts.params && rest.length) {
+				let cur: unknown = opts.params[head];
+				for (const key of rest) {
+					if (cur == null || typeof cur !== 'object') return dflt;
+					cur = (cur as Record<string, unknown>)[key];
+				}
+				return cur ?? dflt;
+			}
+			return dflt;
+		}),
 		getNode: () => ({ name: 'Hugging Face Space' }),
 		continueOnFail: () => opts.continueOnFail ?? false,
 		getCredentials: vi.fn(async () => {
@@ -130,9 +143,9 @@ const run = (ctx: unknown) => HuggingFaceSpace.prototype.execute.call(ctx as nev
 const BASE_PARAMS = {
 	source: 'custom',
 	space: 'Tongyi-MAI/Z-Image-Turbo',
-	apiName: 'generate',
+	apiName: { mode: 'list', value: 'generate' },
 	inputMode: 'named',
-	namedParameters: { parameter: [{ name: 'prompt', value: 'a cat' }] },
+	namedParameters: { mappingMode: 'defineBelow', value: { prompt: 'a cat' } },
 	timeout: 300,
 	additionalOptions: {},
 };
@@ -195,16 +208,11 @@ describe('HuggingFaceSpace.execute', () => {
 		});
 	});
 
-	test('named mode coerces value types before sending', async () => {
+	test('named mode sends every mapped field as its own typed value', async () => {
 		const ctx = makeCtx({
 			params: {
 				...BASE_PARAMS,
-				namedParameters: {
-					parameter: [
-						{ name: 'prompt', value: 'a cat' },
-						{ name: 'steps', value: '12' },
-					],
-				},
+				namedParameters: { mappingMode: 'defineBelow', value: { prompt: 'a cat', steps: 12 } },
 			},
 		});
 		await run(ctx);
@@ -212,22 +220,24 @@ describe('HuggingFaceSpace.execute', () => {
 		expect(JSON.parse(joinCall[1].body).data).toEqual(['a cat', 42, 12]);
 	});
 
-	test('named mode skips nameless entries', async () => {
+	test('named mode skips fields left blank (null or empty string)', async () => {
 		const ctx = makeCtx({
 			params: {
 				...BASE_PARAMS,
-				namedParameters: { parameter: [{ name: '', value: 'x' }, { name: 'prompt', value: 'a cat' }] },
+				namedParameters: { mappingMode: 'defineBelow', value: { prompt: 'a cat', seed: '', steps: null } },
 			},
 		});
-		const [out] = await run(ctx);
-		expect(out).toHaveLength(1);
+		await run(ctx);
+		const joinCall = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
+		// seed/steps fall back to the Space's own declared defaults, not the blanked values.
+		expect(JSON.parse(joinCall[1].body).data).toEqual(['a cat', 42, 8]);
 	});
 
 	test('named mode with an unknown parameter fails loudly', async () => {
 		const ctx = makeCtx({
 			params: {
 				...BASE_PARAMS,
-				namedParameters: { parameter: [{ name: 'promt', value: 'typo' }] },
+				namedParameters: { mappingMode: 'defineBelow', value: { promt: 'typo' } },
 			},
 		});
 		await expect(run(ctx)).rejects.toThrow(
@@ -236,7 +246,7 @@ describe('HuggingFaceSpace.execute', () => {
 	});
 
 	test('named mode against an endpoint missing from /info lists what exists', async () => {
-		const ctx = makeCtx({ params: { ...BASE_PARAMS, apiName: 'infer' } });
+		const ctx = makeCtx({ params: { ...BASE_PARAMS, apiName: { mode: 'list', value: 'infer' } } });
 		await expect(run(ctx)).rejects.toThrow(/has no API endpoint "\/infer"\. Available: \/generate/);
 	});
 
@@ -280,21 +290,21 @@ describe('HuggingFaceSpace.execute', () => {
 		await expect(run(makeCtx({ params: { ...BASE_PARAMS, space: '  ' } }))).rejects.toThrow(
 			/Space cannot be empty/,
 		);
-		await expect(run(makeCtx({ params: { ...BASE_PARAMS, apiName: '' } }))).rejects.toThrow(
-			/API endpoint name cannot be empty/,
-		);
+		await expect(
+			run(makeCtx({ params: { ...BASE_PARAMS, apiName: { mode: 'list', value: '' } } })),
+		).rejects.toThrow(/API endpoint cannot be empty/);
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
 	test('an attached credential sends the HF bearer token', async () => {
-		const ctx = makeCtx({ params: BASE_PARAMS, credential: { apiKey: 'hf_tok' } });
+		const ctx = makeCtx({ params: BASE_PARAMS, credential: { accessToken: 'hf_tok' } });
 		await run(ctx);
 		const joinCall = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
 		expect(joinCall[1].headers.Authorization).toBe('Bearer hf_tok');
 	});
 
-	test('an empty apiKey is treated as anonymous', async () => {
-		const ctx = makeCtx({ params: BASE_PARAMS, credential: { apiKey: '' } });
+	test('an empty accessToken is treated as anonymous', async () => {
+		const ctx = makeCtx({ params: BASE_PARAMS, credential: { accessToken: '' } });
 		await run(ctx);
 		const joinCall = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
 		expect(joinCall[1].headers.Authorization).toBeUndefined();
@@ -433,11 +443,54 @@ describe('HuggingFaceSpace.execute', () => {
 		expect(JSON.parse(joinCall[1].body).data).toEqual([]);
 	});
 
-	test('an empty namedParameters collection sends only schema defaults', async () => {
+	// Regression: `prompt` has no declared default on this endpoint. An empty
+	// mapping used to silently send `null` for it — the exact failure class that
+	// let /detect_pii answer about a fictional person instead of erroring (see
+	// docs/incidents.md). It must fail loudly instead.
+	test('an empty namedParameters collection with a required param set fails loudly, not silently', async () => {
 		const ctx = makeCtx({ params: { ...BASE_PARAMS, namedParameters: {} } });
+		await expect(run(ctx)).rejects.toThrow(/Required parameter\(s\) not set: prompt/);
+	});
+
+	test('a namedParameters collection with every required param set sends the optional schema defaults', async () => {
+		const ctx = makeCtx({
+			params: { ...BASE_PARAMS, namedParameters: { mappingMode: 'defineBelow', value: { prompt: 'a cat' } } },
+		});
 		await run(ctx);
 		const joinCall = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
-		expect(JSON.parse(joinCall[1].body).data).toEqual([null, 42, 8]);
+		expect(JSON.parse(joinCall[1].body).data).toEqual(['a cat', 42, 8]);
+	});
+
+	// The actual original incident, reproduced directly: a moderation Space whose
+	// required text-to-check parameter carries no default fails loudly if left
+	// unmapped, rather than quietly answering about the Space's own demo fixture
+	// with an HTTP 200 and no error. See docs/incidents.md and the a829b5e fix.
+	test('a required parameter left unset on a PII/moderation-style endpoint is rejected, not silently demo-answered', async () => {
+		fetchSpy = makeFetch({
+			'/info': () =>
+				jsonRes({
+					named_endpoints: {
+						'/detect_pii': {
+							parameters: [
+								{ parameter_name: 'text', parameter_has_default: false },
+								{ parameter_name: 'threshold', parameter_has_default: true, parameter_default: 0.5 },
+							],
+						},
+					},
+				}),
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const ctx = makeCtx({
+			params: {
+				...BASE_PARAMS,
+				apiName: { mode: 'list', value: 'detect_pii' },
+				namedParameters: { mappingMode: 'defineBelow', value: { threshold: 0.8 } },
+			},
+		});
+		await expect(run(ctx)).rejects.toThrow(/Required parameter\(s\) not set: text/);
+		// The whole point: the network call must never have happened without the real text.
+		expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes('/queue/join'))).toBe(false);
 	});
 
 	test('a download url with a query string strips it from the filename', async () => {
@@ -478,14 +531,14 @@ describe('HuggingFaceSpace.execute', () => {
 	test('the download request carries the bearer token when a credential is set', async () => {
 		const ctx = makeCtx({
 			params: { ...BASE_PARAMS, additionalOptions: { download: true } },
-			credential: { apiKey: 'hf_tok' },
+			credential: { accessToken: 'hf_tok' },
 		});
 		await run(ctx);
 		const dl = fetchSpy.mock.calls.find((c) => String(c[0]).includes('file='))!;
 		expect(dl[1].headers.Authorization).toBe('Bearer hf_tok');
 	});
 
-	test('a credential with no apiKey field is treated as anonymous', async () => {
+	test('a credential with no accessToken field is treated as anonymous', async () => {
 		const ctx = makeCtx({ params: BASE_PARAMS, credential: {} });
 		await run(ctx);
 		const joinCall = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
@@ -525,7 +578,7 @@ describe('HuggingFaceSpace.execute', () => {
 	});
 });
 
-describe('HuggingFaceSpace.loadOptions.getApiEndpoints', () => {
+describe('HuggingFaceSpace.listSearch.searchApiEndpoints', () => {
 	let fetchSpy: ReturnType<typeof vi.fn>;
 
 	beforeEach(() => {
@@ -544,15 +597,17 @@ describe('HuggingFaceSpace.loadOptions.getApiEndpoints', () => {
 
 	test('lists the Space endpoints with their parameter names', async () => {
 		const node = new HuggingFaceSpace();
-		const opts = await node.methods.loadOptions.getApiEndpoints.call(loadCtx('Tongyi-MAI/Z-Image-Turbo'));
-		expect(opts).toEqual([
+		const { results } = await node.methods.listSearch.searchApiEndpoints.call(
+			loadCtx('Tongyi-MAI/Z-Image-Turbo'),
+		);
+		expect(results).toEqual([
 			{ name: '/generate', value: 'generate', description: '(prompt, seed, steps)' },
 		]);
 	});
 
 	test('returns an empty list when no Space is set yet (no network call)', async () => {
 		const node = new HuggingFaceSpace();
-		expect(await node.methods.loadOptions.getApiEndpoints.call(loadCtx(''))).toEqual([]);
+		expect(await node.methods.listSearch.searchApiEndpoints.call(loadCtx(''))).toEqual({ results: [] });
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
@@ -562,41 +617,206 @@ describe('HuggingFaceSpace.loadOptions.getApiEndpoints', () => {
 		});
 		vi.stubGlobal('fetch', fetchSpy);
 		const node = new HuggingFaceSpace();
-		const opts = await node.methods.loadOptions.getApiEndpoints.call(loadCtx('a/b'));
-		expect(opts[0].description).toBe('no parameters');
+		const { results } = await node.methods.listSearch.searchApiEndpoints.call(loadCtx('a/b'));
+		expect(results[0].description).toBe('no parameters');
 	});
 
 	test('an endpoint whose schema omits parameters entirely is labelled as such', async () => {
 		fetchSpy = makeFetch({ '/info': () => jsonRes({ named_endpoints: { '/ping': {} } }) });
 		vi.stubGlobal('fetch', fetchSpy);
 		const node = new HuggingFaceSpace();
-		const opts = await node.methods.loadOptions.getApiEndpoints.call(loadCtx('a/b'));
-		expect(opts[0].description).toBe('no parameters');
+		const { results } = await node.methods.listSearch.searchApiEndpoints.call(loadCtx('a/b'));
+		expect(results[0].description).toBe('no parameters');
 	});
 
-	test('an /info with no named_endpoints yields an empty dropdown', async () => {
+	test('an /info with no named_endpoints yields an empty list', async () => {
 		fetchSpy = makeFetch({ '/info': () => jsonRes({}) });
 		vi.stubGlobal('fetch', fetchSpy);
 		const node = new HuggingFaceSpace();
-		expect(await node.methods.loadOptions.getApiEndpoints.call(loadCtx('a/b'))).toEqual([]);
+		expect(await node.methods.listSearch.searchApiEndpoints.call(loadCtx('a/b'))).toEqual({ results: [] });
 	});
 
 	test('a config with no api_prefix still reaches /info', async () => {
 		fetchSpy = makeFetch({ '/config': () => jsonRes({ dependencies: [] }) });
 		vi.stubGlobal('fetch', fetchSpy);
 		const node = new HuggingFaceSpace();
-		await node.methods.loadOptions.getApiEndpoints.call(loadCtx('a/b'));
+		await node.methods.listSearch.searchApiEndpoints.call(loadCtx('a/b'));
 		expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith('.hf.space/info'))).toBe(true);
 	});
 
-	test('the dropdown sends the bearer token for a gated Space', async () => {
+	test('the list sends the bearer token for a gated Space', async () => {
 		const node = new HuggingFaceSpace();
 		const ctx = {
 			getNodeParameter: () => 'a/b',
-			getCredentials: async () => ({ apiKey: 'hf_tok' }),
+			getCredentials: async () => ({ accessToken: 'hf_tok' }),
 		} as never;
-		await node.methods.loadOptions.getApiEndpoints.call(ctx);
+		await node.methods.listSearch.searchApiEndpoints.call(ctx);
 		expect(fetchSpy.mock.calls[0][1].headers.Authorization).toBe('Bearer hf_tok');
+	});
+
+	test('a filter narrows results to endpoint names containing it, case-insensitively', async () => {
+		fetchSpy = makeFetch({
+			'/info': () =>
+				jsonRes({
+					named_endpoints: { '/generate_image': { parameters: [] }, '/get_status': { parameters: [] } },
+				}),
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+		const node = new HuggingFaceSpace();
+		const { results } = await node.methods.listSearch.searchApiEndpoints.call(loadCtx('a/b'), 'GEN');
+		const noParamsLabel = 'no parameters';
+		expect(results).toEqual([{ name: '/generate_image', value: 'generate_image', description: noParamsLabel }]);
+	});
+});
+
+describe('HuggingFaceSpace.resourceMapper.getGradioParameters', () => {
+	let fetchSpy: ReturnType<typeof vi.fn>;
+
+	beforeEach(() => {
+		fetchSpy = makeFetch();
+		vi.stubGlobal('fetch', fetchSpy);
+	});
+	afterEach(() => vi.unstubAllGlobals());
+
+	const mapperCtx = (space: string, apiName: string) =>
+		({
+			getNodeParameter: (name: string) => (name === 'space' ? space : { mode: 'list', value: apiName }),
+			getCredentials: async () => {
+				throw new Error('none');
+			},
+		}) as never;
+
+	test('turns the endpoint schema into one field per parameter, typed and defaulted', async () => {
+		const node = new HuggingFaceSpace();
+		const { fields } = await node.methods.resourceMapper.getGradioParameters.call(
+			mapperCtx('Tongyi-MAI/Z-Image-Turbo', 'generate'),
+		);
+		expect(fields).toEqual([
+			{
+				id: 'prompt',
+				displayName: 'prompt',
+				type: 'string',
+				required: true,
+				display: true,
+				defaultMatch: false,
+				canBeUsedToMatch: false,
+				defaultValue: null,
+			},
+			{
+				id: 'seed',
+				displayName: 'seed',
+				type: 'number',
+				required: false,
+				display: true,
+				defaultMatch: false,
+				canBeUsedToMatch: false,
+				defaultValue: 42,
+			},
+			{
+				id: 'steps',
+				displayName: 'steps',
+				type: 'number',
+				required: false,
+				display: true,
+				defaultMatch: false,
+				canBeUsedToMatch: false,
+				defaultValue: 8,
+			},
+		]);
+	});
+
+	test('returns no fields when the Space or endpoint is not yet chosen', async () => {
+		const node = new HuggingFaceSpace();
+		expect(await node.methods.resourceMapper.getGradioParameters.call(mapperCtx('', ''))).toEqual({
+			fields: [],
+		});
+		expect(
+			await node.methods.resourceMapper.getGradioParameters.call(mapperCtx('a/b', '')),
+		).toEqual({ fields: [] });
+	});
+
+	test('returns no fields when the chosen endpoint is missing from /info', async () => {
+		const node = new HuggingFaceSpace();
+		const { fields } = await node.methods.resourceMapper.getGradioParameters.call(
+			mapperCtx('Tongyi-MAI/Z-Image-Turbo', 'nonexistent'),
+		);
+		expect(fields).toEqual([]);
+	});
+
+	test('a boolean-typed Gradio parameter maps to a boolean field', async () => {
+		fetchSpy = makeFetch({
+			'/info': () =>
+				jsonRes({
+					named_endpoints: {
+						'/toggle': {
+							parameters: [
+								{
+									parameter_name: 'enabled',
+									parameter_has_default: true,
+									parameter_default: true,
+									python_type: { type: 'bool' },
+								},
+							],
+						},
+					},
+				}),
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+		const node = new HuggingFaceSpace();
+		const { fields } = await node.methods.resourceMapper.getGradioParameters.call(
+			mapperCtx('a/b', 'toggle'),
+		);
+		expect(fields).toEqual([
+			{
+				id: 'enabled',
+				displayName: 'enabled',
+				type: 'boolean',
+				required: false,
+				display: true,
+				defaultMatch: false,
+				canBeUsedToMatch: false,
+				defaultValue: true,
+			},
+		]);
+	});
+
+	test('a declared numeric type string wins even if the default looks stringy', async () => {
+		fetchSpy = makeFetch({
+			'/info': () =>
+				jsonRes({
+					named_endpoints: {
+						'/scale': {
+							parameters: [
+								{
+									parameter_name: 'factor',
+									parameter_has_default: true,
+									parameter_default: '2',
+									python_type: { type: 'float' },
+								},
+							],
+						},
+					},
+				}),
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+		const node = new HuggingFaceSpace();
+		const { fields } = await node.methods.resourceMapper.getGradioParameters.call(mapperCtx('a/b', 'scale'));
+		expect(fields[0]).toMatchObject({ id: 'factor', type: 'number' });
+	});
+
+	test('no type string and no default falls back to string, not a crash', async () => {
+		fetchSpy = makeFetch({
+			'/info': () =>
+				jsonRes({
+					named_endpoints: {
+						'/echo': { parameters: [{ parameter_name: 'text', parameter_has_default: false }] },
+					},
+				}),
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+		const node = new HuggingFaceSpace();
+		const { fields } = await node.methods.resourceMapper.getGradioParameters.call(mapperCtx('a/b', 'echo'));
+		expect(fields[0]).toMatchObject({ id: 'text', type: 'string', required: true, defaultValue: null });
 	});
 });
 
@@ -939,6 +1159,46 @@ describe('HuggingFaceSpace.execute — catalog mode', () => {
 		expect(JSON.parse(join[1].body).data).toEqual(['a cat', 1]);
 	});
 
+	// Regression: a file-driven model (promptParam: '') used to fall through to
+	// "first declared parameter" for the prompt sentinel, silently overwriting
+	// that Space's real first argument (here, `image`) with the node's Prompt
+	// field text. promptParam: '' is the catalog's explicit "no text prompt"
+	// signal and must drop the sentinel instead of remapping it anywhere.
+	test('a file-driven model (promptParam: "") never has its first parameter clobbered by the prompt', async () => {
+		const config = {
+			version: '6.0.1',
+			api_prefix: '/gradio_api',
+			dependencies: [{ id: 0, api_name: 'image', queue: true }],
+		};
+		const info = {
+			named_endpoints: {
+				'/image': { parameters: [{ parameter_name: 'image', parameter_has_default: false }] },
+			},
+		};
+		fetchSpy = vi.fn(async (url: string) => {
+			const u = String(url);
+			if (u.endsWith('/config')) return jsonRes(config);
+			if (u.includes('/info')) return jsonRes(info);
+			if (u.includes('/queue/join')) return jsonRes({ event_id: 'e' });
+			if (u.includes('/queue/data')) return sseRes([COMPLETED]);
+			return jsonRes({});
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+		await run(
+			makeCtx({
+				params: {
+					...CATALOG_PARAMS,
+					category: 'image-edit',
+					'model_image-edit': 'bg-remove',
+					'known_bg-remove_image': 'https://example.com/photo.png',
+					additionalOptions: { useFallbacks: false },
+				},
+			}),
+		);
+		const join = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
+		expect(JSON.parse(join[1].body).data).toEqual(['https://example.com/photo.png']);
+	});
+
 	// CogVideoX-2B takes num_inference_steps; the 5B fallback does not. An extra
 	// aimed at one Space must not poison a fallback that would otherwise work.
 	test('an extra parameter the Space does not declare is dropped, not fatal', async () => {
@@ -981,6 +1241,105 @@ describe('HuggingFaceSpace.execute — catalog mode', () => {
 		expect((out[0].json.gradio as Record<string, unknown>).droppedParams).toBeUndefined();
 	});
 
+	// KnownExtra fields (Wan 2.1's input_image, ACE-Step's lyrics, …) are read via
+	// the known_<model>_<param> namespaced field and merged into `provided` — this
+	// is the wiring readKnownExtras() does, exercised end-to-end through execute().
+	// Uses a bespoke fetch (not makeCatalogFetch/CATALOG_CONFIG) because this model's
+	// real endpoint name, generate_video, isn't in the shared fixture's api list.
+	test('a model-specific known-extra field reaches the wire under its Gradio parameter name', async () => {
+		const config = {
+			version: '6.0.1',
+			api_prefix: '/gradio_api',
+			dependencies: [{ id: 0, api_name: 'generate_video', queue: true }],
+		};
+		const info = {
+			named_endpoints: {
+				'/generate_video': {
+					parameters: [
+						{ parameter_name: 'prompt', parameter_has_default: false },
+						{ parameter_name: 'input_image', parameter_has_default: false },
+					],
+				},
+			},
+		};
+		fetchSpy = vi.fn(async (url: string) => {
+			const u = String(url);
+			if (u.endsWith('/config')) return jsonRes(config);
+			if (u.includes('/info')) return jsonRes(info);
+			if (u.includes('/queue/join')) return jsonRes({ event_id: 'e' });
+			if (u.includes('/queue/data')) return sseRes([COMPLETED]);
+			return jsonRes({});
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+
+		await run(
+			makeCtx({
+				params: {
+					...CATALOG_PARAMS,
+					category: 'video',
+					model_video: 'wan21-fast',
+					'known_wan21-fast_input_image': 'https://example.com/start.png',
+					additionalOptions: { useFallbacks: false },
+				},
+			}),
+		);
+		const join = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
+		expect(JSON.parse(join[1].body).data).toEqual(['a cat', 'https://example.com/start.png']);
+	});
+
+	// face-swap-cpu's two candidate Spaces name the same image pair differently
+	// (src_img/dest_img vs sourceImage/destinationImage) — mirrorAs fans one field
+	// out to both names so either candidate's schema resolves it via
+	// dropUnknownParams (catalog mode), which drops whichever name the CURRENT
+	// candidate does not declare. Bespoke fetch: the primary (tonyassi/face-swap,
+	// api swap_faces) 503s so the chain must fall through to Dentro/face-swap
+	// (api predict) and still resolve the image pair under ITS parameter names.
+	test('mirrorAs fans a known-extra field out to every Space-specific parameter name', async () => {
+		const config = {
+			version: '6.0.1',
+			api_prefix: '/gradio_api',
+			dependencies: [{ id: 0, api_name: 'predict', queue: true }],
+		};
+		const info = {
+			named_endpoints: {
+				'/predict': {
+					parameters: [
+						{ parameter_name: 'sourceImage', parameter_has_default: false },
+						{ parameter_name: 'destinationImage', parameter_has_default: false },
+					],
+				},
+			},
+		};
+		fetchSpy = vi.fn(async (url: string) => {
+			const u = String(url);
+			if (u.includes('tonyassi') && u.endsWith('/config')) return jsonRes({}, false, 503);
+			if (u.endsWith('/config')) return jsonRes(config);
+			if (u.includes('/info')) return jsonRes(info);
+			if (u.includes('/queue/join')) return jsonRes({ event_id: 'e' });
+			if (u.includes('/queue/data')) return sseRes([COMPLETED]);
+			return jsonRes({});
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const [out] = await run(
+			makeCtx({
+				params: {
+					...CATALOG_PARAMS,
+					category: 'face-swap',
+					'model_face-swap': 'face-swap-cpu',
+					'known_face-swap-cpu_src_img': 'https://example.com/face.png',
+					'known_face-swap-cpu_dest_img': 'https://example.com/target.png',
+				},
+			}),
+		);
+		const join = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
+		expect(JSON.parse(join[1].body).data).toEqual([
+			'https://example.com/face.png',
+			'https://example.com/target.png',
+		]);
+		expect((out[0].json.gradio as Record<string, unknown>).space).toBe('Dentro/face-swap');
+	});
+
 	// In custom mode there is no fallback chain, so an unknown name is a typo.
 	test('custom mode still rejects an unknown parameter as a typo', async () => {
 		fetchSpy = makeFetch();
@@ -990,7 +1349,7 @@ describe('HuggingFaceSpace.execute — catalog mode', () => {
 				makeCtx({
 					params: {
 						...BASE_PARAMS,
-						namedParameters: { parameter: [{ name: 'nonsense', value: '1' }] },
+						namedParameters: { mappingMode: 'defineBelow', value: { nonsense: 1 } },
 					},
 				}),
 			),

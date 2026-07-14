@@ -63,6 +63,43 @@ export interface CatalogSpace {
 	defaults?: Record<string, unknown>;
 }
 
+/**
+ * A model-specific argument surfaced as its OWN node field instead of forcing the
+ * user to hand-type its name into the generic "Extra Parameters" list.
+ *
+ * This exists because several catalog models have a REQUIRED non-prompt argument
+ * (Seed-VC needs two audio clips; LatentSync needs a video + an audio track; ACE-
+ * Step needs lyrics) that used to live only in a `note:` string ("Pass
+ * source_audio_path via Extra Parameters") — text a user had to read, then
+ * hand-type the exact parameter name into a free-text row. `knownExtras` turns
+ * that same information into a real field, gated to only that model, so the field
+ * itself teaches the user what it does instead of the catalog's prose.
+ */
+export interface KnownExtra {
+	/** The Gradio parameter name this field's value is sent as. */
+	name: string;
+	/** Node UI label, Title Case. */
+	displayName: string;
+	type: 'string' | 'number' | 'boolean';
+	description: string;
+	default: string | number | boolean;
+	/** Multi-line textarea (lyrics, long instructions). String fields only. */
+	multiline?: boolean;
+	required?: boolean;
+	/**
+	 * Also send this value under these additional parameter names.
+	 *
+	 * Exists because fallback Spaces for the same model sometimes name the same
+	 * argument differently (face-swap-cpu's two candidates take src_img/dest_img
+	 * vs sourceImage/destinationImage for the identical pair of images). Rather
+	 * than make the user pick a name that only works for one candidate,
+	 * `mirrorAs` fans one field out to every name any candidate might declare;
+	 * `dropUnknownParams` (catalog mode only) then silently discards whichever
+	 * name the CURRENT candidate doesn't recognize, so exactly one survives.
+	 */
+	mirrorAs?: string[];
+}
+
 export interface CatalogModel {
 	value: string;
 	name: string;
@@ -83,6 +120,8 @@ export interface CatalogModel {
 	 * entry stays in the catalog, but the dropdown warns before you burn a run on it.
 	 */
 	requiresPaidGpu?: string;
+	/** Model-specific fields shown only when this model is selected. See KnownExtra. */
+	knownExtras?: KnownExtra[];
 }
 
 export interface Category {
@@ -343,12 +382,22 @@ export const CATEGORIES: Category[] = [
 				name: 'Wan 2.1 (fast)',
 				bestFor: 'Image-to-video, quickest Wan',
 				stars: 4,
-				note: 'IMAGE-TO-VIDEO: needs an input_image, not just a prompt. Pass it via Extra Parameters.',
+				note: 'Image-to-video: needs a starting image, not just a prompt',
 				spaces: [
 					{ space: 'multimodalart/wan2-1-fast', api: 'generate_video', promptParam: 'prompt' },
 				],
 				requiresPaidGpu:
 					'video generation requests far more GPU-seconds than a free ZeroGPU account may spend in one call. Needs an HF PRO token.',
+				knownExtras: [
+					{
+						displayName: 'Input Image URL',
+						name: 'input_image',
+						type: 'string',
+						description: 'URL of the starting image to animate into video',
+						default: '',
+						required: true,
+					},
+				],
 			},
 			{
 				value: 'wan22',
@@ -390,10 +439,20 @@ export const CATEGORIES: Category[] = [
 				name: 'IndexTTS',
 				bestFor: 'High-quality TTS with voice cloning',
 				stars: 5,
-				note: 'Clones a voice from a reference clip. Pass the reference audio as the "prompt" Extra Parameter; the text to speak is the Prompt field.',
+				note: 'Clones a voice from a reference clip; the Prompt field is the text to speak',
 				spaces: [{ space: 'IndexTeam/IndexTTS', api: 'gen_single', promptParam: 'text' }],
 				requiresPaidGpu:
 					'runs on ZeroGPU (zero-a10g). Callable on an HF PRO token; a free account will hit the per-call GPU ceiling.',
+				knownExtras: [
+					{
+						displayName: 'Reference Audio URL',
+						name: 'prompt',
+						type: 'string',
+						description: 'URL of a short reference audio clip whose voice will be cloned',
+						default: '',
+						required: true,
+					},
+				],
 			},
 			{
 				value: 'bark',
@@ -457,10 +516,27 @@ export const CATEGORIES: Category[] = [
 				name: 'Seed-VC',
 				bestFor: 'Best overall voice conversion',
 				stars: 5,
-				note: 'Needs TWO audio inputs. Pass source_audio_path (the speech) and target_audio_path (the voice to copy) via Extra Parameters.',
+				note: 'Needs two audio inputs: the speech to convert, and the voice to copy',
 				spaces: [{ space: 'Plachta/Seed-VC', api: 'predict', promptParam: '' }],
-				requiresPaidGpu:
-					'runs on ZeroGPU (zero-a10g). Needs an HF PRO token.',
+				requiresPaidGpu: 'runs on ZeroGPU (zero-a10g). Needs an HF PRO token.',
+				knownExtras: [
+					{
+						displayName: 'Source Audio URL',
+						name: 'source_audio_path',
+						type: 'string',
+						description: 'URL of the speech audio to convert',
+						default: '',
+						required: true,
+					},
+					{
+						displayName: 'Target Voice Audio URL',
+						name: 'target_audio_path',
+						type: 'string',
+						description: 'URL of a reference clip of the voice to convert into',
+						default: '',
+						required: true,
+					},
+				],
 			},
 			{
 				value: 'openvoice-v2',
@@ -500,12 +576,30 @@ export const CATEGORIES: Category[] = [
 				name: 'LatentSync',
 				bestFor: 'Highest-quality offline lipsync',
 				stars: 5,
-				note: 'Takes a VIDEO + an AUDIO file (no text prompt). Pass input_video_path and input_audio_path via Extra Parameters.',
+				note: 'Takes a video + an audio track — no text prompt',
 				spaces: [
 					{ space: 'fffiloni/LatentSync', api: 'generate_lip_sync_video', promptParam: '' },
 				],
 				requiresPaidGpu:
 					'runs on ZeroGPU (zero-a10g) and video work is GPU-heavy. Needs an HF PRO token.',
+				knownExtras: [
+					{
+						displayName: 'Input Video URL',
+						name: 'input_video_path',
+						type: 'string',
+						description: 'URL of the face video to drive',
+						default: '',
+						required: true,
+					},
+					{
+						displayName: 'Input Audio URL',
+						name: 'input_audio_path',
+						type: 'string',
+						description: 'URL of the audio track to lip-sync the video to',
+						default: '',
+						required: true,
+					},
+				],
 			},
 			{
 				value: 'musetalk',
@@ -543,10 +637,33 @@ export const CATEGORIES: Category[] = [
 				name: 'InsightFace (InSwapper)',
 				bestFor: 'Industry-standard face swap',
 				stars: 5,
-				note: 'CPU-only Spaces, so they spend NO ZeroGPU quota — these work even when GPU quota is exhausted. No text prompt: pass the two images via Extra Parameters (primary: src_img + dest_img; fallback: sourceImage + destinationImage).',
+				note: 'CPU-only, so it spends no ZeroGPU quota — works even when GPU quota is exhausted. No text prompt.',
 				spaces: [
 					{ space: 'tonyassi/face-swap', api: 'swap_faces', promptParam: '', cpuOnly: true },
 					{ space: 'Dentro/face-swap', api: 'predict', promptParam: '', cpuOnly: true },
+				],
+				// The two candidates name this pair differently (tonyassi: src_img/
+				// dest_img; Dentro: sourceImage/destinationImage) — mirrorAs sends each
+				// field under both names, so filling in one pair works against either.
+				knownExtras: [
+					{
+						displayName: 'Source Face Image URL',
+						name: 'src_img',
+						type: 'string',
+						description: 'URL of the image containing the face to insert',
+						default: '',
+						required: true,
+						mirrorAs: ['sourceImage'],
+					},
+					{
+						displayName: 'Destination Image URL',
+						name: 'dest_img',
+						type: 'string',
+						description: 'URL of the image the face will be swapped into',
+						default: '',
+						required: true,
+						mirrorAs: ['destinationImage'],
+					},
 				],
 			},
 		],
@@ -562,13 +679,29 @@ export const CATEGORIES: Category[] = [
 				bestFor: 'Full songs WITH VOCALS (the open Suno)',
 				stars: 5,
 				note:
-					'The closest open equivalent to Suno: give it a style prompt AND `lyrics`, get back a sung ' +
-					'track. Verified: a 30s 320kbps stereo song in 12.9s. `lyrics` accepts [verse]/[chorus] tags; ' +
-					'omit it and you get an instrumental. Set `audio_duration` (seconds) via Extra Parameters.',
+					'The closest open equivalent to Suno. The Prompt field is the STYLE tag list ("indie folk, ' +
+					'warm male vocals"), not the lyrics. Verified: a 30s 320kbps stereo song in 12.9s.',
 				spaces: [
 					// The prompt here is the STYLE tag list ("indie folk, warm male vocals"),
 					// not the lyrics — lyrics are a separate arg. That is how ACE-Step works.
 					{ space: 'ACE-Step/ACE-Step', api: '__call__', promptParam: 'prompt' },
+				],
+				knownExtras: [
+					{
+						displayName: 'Lyrics',
+						name: 'lyrics',
+						type: 'string',
+						multiline: true,
+						description: 'Song lyrics; accepts [verse]/[chorus] tags. Leave empty for an instrumental.',
+						default: '',
+					},
+					{
+						displayName: 'Duration (Seconds)',
+						name: 'audio_duration',
+						type: 'number',
+						description: 'Length of the generated track in seconds',
+						default: 30,
+					},
 				],
 			},
 			{
@@ -576,10 +709,19 @@ export const CATEGORIES: Category[] = [
 				name: 'Stable Audio Open',
 				bestFor: 'Instrumental beds, loops, SFX',
 				stars: 4,
-				note: 'Instrumental only (no vocals). Good for background music and sound effects. `seconds_total` sets the length.',
+				note: 'Instrumental only (no vocals). Good for background music and sound effects.',
 				spaces: [
 					{ space: 'artificialguybr/Stable-Audio-Open-Zero', api: 'predict', promptParam: 'prompt' },
 					{ space: 'stabilityai/stable-audio-3', api: 'infer', promptParam: 'prompt' },
+				],
+				knownExtras: [
+					{
+						displayName: 'Duration (Seconds)',
+						name: 'seconds_total',
+						type: 'number',
+						description: 'Length of the generated audio in seconds',
+						default: 30,
+					},
 				],
 			},
 			{
@@ -654,12 +796,21 @@ export const CATEGORIES: Category[] = [
 				stars: 5,
 				note:
 					'Give it an image + an instruction ("make the sky stormy", "turn this into a blueprint"). ' +
-					'Pass the image via Extra Parameters as `image` — a Gradio FileData object pointing at a ' +
-					'public URL works, e.g. {"image": {"url": "https://…/hero.png", "meta": {"_type": "gradio.FileData"}}}. ' +
-					'The official Space is busy and can abort under load; the 2511 fallback takes `images` (an array).',
+					'The official Space is busy and can abort under load; the 2511 fallback takes an array of ' +
+					'images and is not covered by the Input Image URL field below — use Custom Space mode for it.',
 				spaces: [
 					{ space: 'Qwen/Qwen-Image-Edit', api: 'infer', promptParam: 'prompt' },
 					{ space: 'Qwen/Qwen-Image-Edit-2511', api: 'infer', promptParam: 'prompt' },
+				],
+				knownExtras: [
+					{
+						displayName: 'Input Image URL',
+						name: 'image',
+						type: 'string',
+						description: 'URL of the image to edit. Sent as a Gradio FileData object.',
+						default: '',
+						required: true,
+					},
 				],
 			},
 			{
@@ -669,9 +820,18 @@ export const CATEGORIES: Category[] = [
 				stars: 5,
 				note:
 					'The most-liked background remover on HF (2.8k+). Verified end-to-end: fed a generated image ' +
-					'by URL, got a clean cutout in 3.5s. No text prompt — pass `image` via Extra Parameters. ' +
-					'Ideal for product shots.',
+					'by URL, got a clean cutout in 3.5s. No text prompt. Ideal for product shots.',
 				spaces: [{ space: 'not-lain/background-removal', api: 'image', promptParam: '' }],
+				knownExtras: [
+					{
+						displayName: 'Input Image URL',
+						name: 'image',
+						type: 'string',
+						description: 'URL of the image to remove the background from',
+						default: '',
+						required: true,
+					},
+				],
 			},
 			{
 				value: 'upscale',
@@ -679,10 +839,20 @@ export const CATEGORIES: Category[] = [
 				bestFor: 'Enlarge / restore detail',
 				stars: 4,
 				note:
-					'Verified: 5.3s. No text prompt — pass the image as `param_0` via Extra Parameters (this Space ' +
-					'exposes unnamed positional args). NOTE: jasperai/Flux.1-dev-Controlnet-Upscaler is more ' +
-					'popular but publishes NO callable endpoint, so it is deliberately not used here.',
+					'Verified: 5.3s. No text prompt; this Space exposes unnamed positional args. NOTE: ' +
+					'jasperai/Flux.1-dev-Controlnet-Upscaler is more popular but publishes no callable endpoint, ' +
+					'so it is deliberately not used here.',
 				spaces: [{ space: 'gokaygokay/Tile-Upscaler', api: 'wrapper', promptParam: '' }],
+				knownExtras: [
+					{
+						displayName: 'Input Image URL',
+						name: 'param_0',
+						type: 'string',
+						description: 'URL of the image to upscale (this Space names its only argument param_0)',
+						default: '',
+						required: true,
+					},
+				],
 			},
 		],
 	},
@@ -697,9 +867,8 @@ export const CATEGORIES: Category[] = [
 				bestFor: 'Documents, receipts, screenshots',
 				stars: 5,
 				note:
-					'Verified: 15.6s. Pass `image` via Extra Parameters (FileData/URL). `task_type` selects the ' +
-					'mode — "📝 Free OCR" for plain text extraction. Useful for turning a source PDF/screenshot ' +
-					'into text a blogger can work from.',
+					'Verified: 15.6s. Defaults to plain-text extraction mode. Useful for turning a source ' +
+					'PDF/screenshot into text a blogger can work from.',
 				spaces: [
 					{
 						space: 'khang119966/DeepSeek-OCR-DEMO',
@@ -708,6 +877,16 @@ export const CATEGORIES: Category[] = [
 						defaults: { task_type: '📝 Free OCR' },
 					},
 					{ space: 'baidu/Unlimited-OCR', api: 'run_ocr', promptParam: 'prompt' },
+				],
+				knownExtras: [
+					{
+						displayName: 'Input Image URL',
+						name: 'image',
+						type: 'string',
+						description: 'URL of the document/screenshot image to read',
+						default: '',
+						required: true,
+					},
 				],
 			},
 		],
