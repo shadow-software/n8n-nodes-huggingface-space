@@ -249,6 +249,12 @@ Pinning our own copy would only risk breaking compatibility with the host.
 - **Hugging Face Spaces** — [huggingface.co/spaces](https://huggingface.co/spaces) · **[Gradio API](https://www.gradio.app/guides/getting-started-with-the-python-client)**
 - **Also by us** — [n8n-nodes-custom-exec](https://www.npmjs.com/package/n8n-nodes-custom-exec): run shell tooling (ffmpeg, imagemagick, pandoc, …) on a remote exec service from a workflow.
 
+We also build and open-source a family of WordPress plugins and themes for
+WooCommerce stores: [Broadside](https://github.com/shadow-software/broadside-theme-for-woocommerce)
+(theme) and [Broadside Blocks](https://github.com/shadow-software/broadside-blocks-for-woocommerce),
+[Crypto for WooCommerce](https://github.com/shadow-software/crypto-for-woocommerce), and
+[AGT for WooCommerce](https://github.com/shadow-software/agt-for-woocommerce).
+
 ## About
 
 Made by **[Shadow Software](https://shadowsoftware.com)** — we build and run
