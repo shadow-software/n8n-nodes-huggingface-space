@@ -87,7 +87,10 @@ jobs:
       # are already explicit steps above.
       - name: Verify package contents
         run: |
-          npm pack --dry-run --json --ignore-scripts > /tmp/pack.json
+          npm pack --dry-run --json --ignore-scripts > /tmp/pack.json 2>/tmp/pack.err || true
+          echo "--- pack.json (first 20 lines) ---"; head -20 /tmp/pack.json
+          echo "--- pack.err ---"; head -5 /tmp/pack.err || true
+          echo "--- end ---"
           node -e "
             const raw = require('/tmp/pack.json');
             // npm has shipped both shapes across versions; accept either rather than
