@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-huggingface-space",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Run inference on any Hugging Face Gradio Space from n8n — images, text, video, music, speech, moderation and more, with a curated model catalog and automatic fallbacks.",
   "keywords": [
     "n8n-community-node-package",
