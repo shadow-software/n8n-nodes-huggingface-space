@@ -50,6 +50,18 @@ function knownExtraFieldName(modelValue: string, extraName: string): string {
  * in catalog.ts), gated to show only when that exact category + model is
  * selected in Catalog mode — the same displayOptions pattern already used for
  * the per-category model dropdown above.
+ *
+ * Deliberately NEVER sets `required: true` on the n8n property itself, even
+ * for a KnownExtra whose OWN `required` flag is true. n8n's workflow-activation
+ * validator checks every `required: true` property on a node against the
+ * node's CURRENT parameter values — it does not evaluate `displayOptions`
+ * first. A field hidden behind `displayOptions` for every model except one
+ * still gets flagged as "missing" for a workflow configured to any OTHER
+ * model, and the workflow fails to publish/activate. (Confirmed live: this
+ * broke every Gradio workflow's deploy the first time these fields shipped
+ * with `required: true`.) `extra.required` is enforced INSTEAD by
+ * readKnownExtras() at execute() time, which is the only place that actually
+ * knows which model is selected.
  */
 function buildKnownExtraProperties(): INodeProperties[] {
 	const fields: INodeProperties[] = [];
@@ -65,8 +77,7 @@ function buildKnownExtraProperties(): INodeProperties[] {
 						show: { source: ['catalog'], category: [cat.value], [`model_${cat.value}`]: [model.value] },
 					},
 					default: extra.default,
-					...(extra.required ? { required: true } : {}),
-					description: extra.description,
+					description: extra.required ? `${extra.description} (required)` : extra.description,
 				} as INodeProperties);
 			}
 		}
@@ -82,6 +93,11 @@ function buildKnownExtraProperties(): INodeProperties[] {
  * mirrorAs fans a single field's value out to additional Gradio parameter names
  * (see KnownExtra) — needed because some models' fallback Spaces name the same
  * argument differently.
+ *
+ * Throws if a KnownExtra marked `required` is left blank, rather than silently
+ * sending nothing and letting the Space fall back to its own default — this is
+ * the enforcement buildKnownExtraProperties() deliberately cannot do at the n8n
+ * property level (see its comment).
  */
 function readKnownExtras(
 	ctx: IExecuteFunctions,
@@ -89,14 +105,27 @@ function readKnownExtras(
 	itemIndex: number,
 ): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
+	const missing: string[] = [];
 	for (const extra of model.knownExtras ?? []) {
 		const fieldName = knownExtraFieldName(model.value, extra.name);
 		const value = ctx.getNodeParameter(fieldName, itemIndex, extra.default);
-		// An empty optional string is "not set" — don't send it and override a
-		// Space's own default with an empty value.
-		if (value === '' && !extra.required) continue;
+		if (value === '') {
+			if (extra.required) missing.push(extra.displayName);
+			// An empty optional string is "not set" — don't send it and override a
+			// Space's own default with an empty value.
+			continue;
+		}
 		out[extra.name] = value;
 		for (const alias of extra.mirrorAs ?? []) out[alias] = value;
+	}
+	if (missing.length) {
+		throw new NodeOperationError(
+			ctx.getNode(),
+			`Required field(s) not set: ${missing.join(', ')}. ${model.name} needs ${
+				missing.length > 1 ? 'these' : 'this'
+			} to run.`,
+			{ itemIndex },
+		);
 	}
 	return out;
 }

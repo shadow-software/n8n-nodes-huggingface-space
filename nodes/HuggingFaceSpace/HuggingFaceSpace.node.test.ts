@@ -150,6 +150,33 @@ const BASE_PARAMS = {
 	additionalOptions: {},
 };
 
+describe('HuggingFaceSpace.description.properties — known-extra fields never set required', () => {
+	// n8n's workflow-activation validator checks `required: true` node properties
+	// against a node's CURRENT parameter values WITHOUT first evaluating
+	// displayOptions. A known-extra field is required only for its one specific
+	// model but hidden for every other — if the n8n property carried
+	// `required: true`, a workflow using ANY other model fails to publish with
+	// "Missing or invalid required parameters". This broke the real deploy the
+	// first time these fields shipped that way. This test is the static guard
+	// against it recurring: no known_* property may ever declare
+	// `required: true` at the n8n property level, regardless of what the
+	// catalog's own KnownExtra.required says.
+	test('no known_* property in the node description sets n8n required:true', () => {
+		const node = new HuggingFaceSpace();
+		const offenders = node.description.properties
+			.filter((p) => p.name.startsWith('known_'))
+			.filter((p) => p.required === true)
+			.map((p) => p.name);
+		expect(offenders).toEqual([]);
+	});
+
+	test('at least one known_* property exists (the check above is not vacuous)', () => {
+		const node = new HuggingFaceSpace();
+		const knownFields = node.description.properties.filter((p) => p.name.startsWith('known_'));
+		expect(knownFields.length).toBeGreaterThan(0);
+	});
+});
+
 describe('coerce', () => {
 	test('turns numeric/boolean/null strings into real JSON types', () => {
 		expect(coerce('1024')).toBe(1024);
@@ -1285,6 +1312,43 @@ describe('HuggingFaceSpace.execute — catalog mode', () => {
 		);
 		const join = fetchSpy.mock.calls.find((c) => String(c[0]).includes('/queue/join'))!;
 		expect(JSON.parse(join[1].body).data).toEqual(['a cat', 'https://example.com/start.png']);
+	});
+
+	// Regression: a required known-extra field left blank must fail loudly at
+	// execute() time, not silently omit itself and let Gradio use its own
+	// default. This is the execute()-time half of the fix — the n8n-property
+	// `required: true` was REMOVED from these fields (see buildKnownExtraProperties)
+	// because it broke workflow activation for every OTHER model in the catalog;
+	// this test is what stands in its place.
+	test('leaving a required known-extra field blank fails loudly, not silently', async () => {
+		fetchSpy = makeCatalogFetch();
+		vi.stubGlobal('fetch', fetchSpy);
+		await expect(
+			run(
+				makeCtx({
+					params: {
+						...CATALOG_PARAMS,
+						category: 'video',
+						model_video: 'wan21-fast',
+						additionalOptions: { useFallbacks: false },
+					},
+				}),
+			),
+		).rejects.toThrow(/Required field\(s\) not set: Input Image URL/);
+	});
+
+	// The bug that broke deploy: a model with NO knownExtras (flux2-dev) must
+	// never be blocked by another model's required field. buildKnownExtraProperties
+	// deliberately does not set n8n's own `required: true` on ANY known-extra
+	// field for exactly this reason — confirm readKnownExtras agrees by running
+	// clean for a model with no known-extras at all.
+	test('a model with no knownExtras is unaffected by other models\' required fields', async () => {
+		fetchSpy = makeCatalogFetch();
+		vi.stubGlobal('fetch', fetchSpy);
+		const [out] = await run(
+			makeCtx({ params: { ...CATALOG_PARAMS, additionalOptions: { useFallbacks: false } } }),
+		);
+		expect((out[0].json.gradio as Record<string, unknown>).space).toBe('black-forest-labs/FLUX.2-dev');
 	});
 
 	// face-swap-cpu's two candidate Spaces name the same image pair differently
