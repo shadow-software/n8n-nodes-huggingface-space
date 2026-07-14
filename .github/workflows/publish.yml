@@ -25,6 +25,13 @@ jobs:
   publish:
     runs-on: ubuntu-latest
 
+    # Hoisted to the JOB so the org-grant step's `if:` can read it. The `secrets`
+    # context is NOT available inside an `if:` — not at job level and not at step
+    # level — and a step's own `env:` is not in scope for its own `if:` either. A
+    # job-level env is the one thing that works.
+    env:
+      HAVE_ADMIN_TOKEN: ${{ secrets.NPM_ADMIN_TOKEN != '' }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -87,3 +94,28 @@ jobs:
 
       - name: Publish
         run: npm publish --provenance --access public
+
+      # Hand the package to the org on its FIRST publish.
+      #
+      # The package name is unscoped on purpose (16 of the top 20 n8n community nodes
+      # are, and it is what a user types into n8n's "Install community node" box), but
+      # npm lets an ORGANISATION manage an unscoped package — so we get the short name
+      # AND org ownership, exactly as n8n-nodes-custom-exec does.
+      #
+      # This cannot be pre-granted: npm 403s on `access grant` for a package that does
+      # not exist yet. It has to happen right after the first publish, which is exactly
+      # the moment a human forgets. So it runs here.
+      #
+      # Needs a token because OIDC's short-lived credential only authorises the publish
+      # itself, not org administration. Non-fatal: a failure here leaves the package
+      # published and owned by the publishing user, which is recoverable with one
+      # command — it must not fail an otherwise-good release.
+      - name: Give the org read-write on the package
+        if: ${{ env.HAVE_ADMIN_TOKEN == 'true' }}
+        env:
+          NPM_ADMIN_TOKEN: ${{ secrets.NPM_ADMIN_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_ADMIN_TOKEN}" > ~/.npmrc
+          npm access grant read-write shadow-software:developers "$(node -p "require('./package.json').name")" \
+            || echo "::warning::could not grant org access — run 'npm access grant read-write shadow-software:developers n8n-nodes-huggingface-space' by hand"
+          rm -f ~/.npmrc
