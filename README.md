@@ -30,6 +30,11 @@ It ships two ways to use it:
   names are read live from the Space's own schema, so you pass arguments by name
   instead of hand-counting a positional array.
 
+> Built and maintained by **[Shadow Software](https://shadowsoftware.com)** — we run
+> n8n in production across a family of products and open-source the nodes we rely on.
+> See our other node, **[n8n-nodes-custom-exec](https://www.npmjs.com/package/n8n-nodes-custom-exec)**,
+> for running shell tooling (ffmpeg, imagemagick, …) from a workflow.
+
 [Installation](#installation) · [Credentials](#credentials) · [Usage](#usage) · [Models](#models) · [Quota](#a-note-on-gpu-quota) · [Compatibility](#compatibility)
 
 ## Installation
@@ -236,11 +241,20 @@ A plain `npm audit` does report advisories. Every one of them comes from
 own tree, so those advisories are resolved by upgrading n8n, not this package.
 Pinning our own copy would only risk breaking compatibility with the host.
 
-## Resources
+## Links
 
-- [n8n community nodes documentation](https://docs.n8n.io/integrations/community-nodes/)
-- [Hugging Face Spaces](https://huggingface.co/spaces)
-- [Gradio API docs](https://www.gradio.app/guides/getting-started-with-the-python-client)
+- **npm** — [n8n-nodes-huggingface-space](https://www.npmjs.com/package/n8n-nodes-huggingface-space)
+- **Source** — [github.com/shadow-software/n8n-nodes-huggingface-space](https://github.com/shadow-software/n8n-nodes-huggingface-space)
+- **n8n community nodes** — [installation & docs](https://docs.n8n.io/integrations/community-nodes/)
+- **Hugging Face Spaces** — [huggingface.co/spaces](https://huggingface.co/spaces) · **[Gradio API](https://www.gradio.app/guides/getting-started-with-the-python-client)**
+- **Also by us** — [n8n-nodes-custom-exec](https://www.npmjs.com/package/n8n-nodes-custom-exec): run shell tooling (ffmpeg, imagemagick, pandoc, …) on a remote exec service from a workflow.
+
+## About
+
+Made by **[Shadow Software](https://shadowsoftware.com)** — we build and run
+automation-heavy SaaS products and open-source the n8n nodes we depend on. If you
+need custom n8n nodes, workflow automation, or a platform built around it, get in
+touch at **[shadowsoftware.com](https://shadowsoftware.com)**.
 
 ## License
 
