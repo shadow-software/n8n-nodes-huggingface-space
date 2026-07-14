@@ -73,13 +73,31 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Fails the release if `files`/.npmignore ever let a source or test file
-      # into the tarball, or if dist is missing.
+      # Fails the release if `files`/.npmignore ever let a source or test file into
+      # the tarball, or if dist is missing.
+      #
+      # `--ignore-scripts` is load-bearing. Without it, `npm pack` fires
+      # prepublishOnly (build + lint + test), whose stdout lands in the SAME redirect
+      # as the --json payload — so pack.json becomes test output followed by JSON, and
+      # `JSON.parse` yields undefined. That is exactly how the first v1.0.0 release
+      # died, at this step, having never reached the publish. It passed locally only
+      # because a warm cache made the build silent.
+      #
+      # Re-running those scripts here would be pointless anyway: lint, test and build
+      # are already explicit steps above.
       - name: Verify package contents
         run: |
-          npm pack --dry-run --json > /tmp/pack.json
+          npm pack --dry-run --json --ignore-scripts > /tmp/pack.json
           node -e "
-            const files = require('/tmp/pack.json')[0].files.map(f => f.path);
+            const raw = require('/tmp/pack.json');
+            // npm has shipped both shapes across versions; accept either rather than
+            // pin the release to one npm release line.
+            const entry = Array.isArray(raw) ? raw[0] : raw;
+            if (!entry || !entry.files) {
+              console.error('could not read the tarball manifest from npm pack --json');
+              process.exit(1);
+            }
+            const files = entry.files.map(f => f.path);
             const stray = files.filter(f => !f.startsWith('dist/') && !/^(package\.json|README\.md|LICENSE\.md)$/.test(f));
             if (stray.length) {
               console.error('Unexpected files in the published tarball:', stray);
