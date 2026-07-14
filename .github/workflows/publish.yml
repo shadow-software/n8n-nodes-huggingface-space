@@ -76,28 +76,31 @@ jobs:
       # Fails the release if `files`/.npmignore ever let a source or test file into
       # the tarball, or if dist is missing.
       #
-      # `--ignore-scripts` is load-bearing. Without it, `npm pack` fires
-      # prepublishOnly (build + lint + test), whose stdout lands in the SAME redirect
-      # as the --json payload — so pack.json becomes test output followed by JSON, and
-      # `JSON.parse` yields undefined. That is exactly how the first v1.0.0 release
-      # died, at this step, having never reached the publish. It passed locally only
-      # because a warm cache made the build silent.
+      # Two things bit us here, both only visible on a cold runner:
       #
-      # Re-running those scripts here would be pointless anyway: lint, test and build
-      # are already explicit steps above.
+      #  1. `npm pack` fires prepublishOnly (build + lint + test), and that output
+      #     landed in the SAME redirect as the --json payload, so pack.json was test
+      #     output followed by JSON. Hence --ignore-scripts: lint, test and build are
+      #     already explicit steps above, so re-running them here bought nothing.
+      #
+      #  2. npm's --json manifest has THREE shapes across versions. The runner's npm
+      #     emits a map KEYED BY PACKAGE NAME:
+      #         { "n8n-nodes-huggingface-space": { files: [...] } }
+      #     while older npm emits a bare array, and some emit a bare object. Guessing
+      #     cost two failed releases; this normalises all three.
       - name: Verify package contents
         run: |
-          npm pack --dry-run --json --ignore-scripts > /tmp/pack.json 2>/tmp/pack.err || true
-          echo "--- pack.json (first 20 lines) ---"; head -20 /tmp/pack.json
-          echo "--- pack.err ---"; head -5 /tmp/pack.err || true
-          echo "--- end ---"
+          npm pack --dry-run --json --ignore-scripts > /tmp/pack.json
           node -e "
             const raw = require('/tmp/pack.json');
-            // npm has shipped both shapes across versions; accept either rather than
-            // pin the release to one npm release line.
-            const entry = Array.isArray(raw) ? raw[0] : raw;
-            if (!entry || !entry.files) {
-              console.error('could not read the tarball manifest from npm pack --json');
+            const entry =
+              Array.isArray(raw)      ? raw[0]                       // [ {...} ]
+              : raw && raw.files      ? raw                          // { files: [...] }
+              : raw                   ? Object.values(raw)[0]        // { '<pkg>': {...} }
+              : null;
+            if (!entry || !Array.isArray(entry.files)) {
+              console.error('could not read the tarball manifest. npm pack --json gave:');
+              console.error(JSON.stringify(raw).slice(0, 400));
               process.exit(1);
             }
             const files = entry.files.map(f => f.path);
