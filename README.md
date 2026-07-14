@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/assets/banner.svg" alt="Hugging Face Space — community node for n8n, by Shadow Software" width="880">
+  <img src="https://raw.githubusercontent.com/shadow-software/n8n-nodes-huggingface-space/main/.github/assets/banner.svg" alt="Hugging Face Space — community node for n8n, by Shadow Software" width="880">
 </p>
 
 <p align="center">
