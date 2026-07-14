@@ -28,11 +28,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node 22, NOT 20: npm's Trusted Publishing requires npm >= 11.5.1 and Node >=
+      # 22.14.0. Node 20 ships an npm far older than that, and `npm publish` would
+      # fail to exchange the OIDC token — an auth failure at the very last step, after
+      # lint, tests and build had all passed, and only ever visible on a real release.
+      # The node itself still SUPPORTS Node 20 at runtime (see CI, which tests both);
+      # this pin is purely about the publishing toolchain.
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           cache: 'npm'
+
+      # setup-node's bundled npm can lag; pin the floor Trusted Publishing needs.
+      - name: Ensure an npm that supports Trusted Publishing
+        run: |
+          npm install -g npm@latest
+          echo "npm $(npm --version) on node $(node --version)"
+          node -e "
+            const [maj, min, pat] = process.versions.node.split('.').map(Number);
+            const ok = maj > 22 || (maj === 22 && (min > 14 || (min === 14 && pat >= 0)));
+            if (!ok) { console.error('Node ' + process.versions.node + ' < 22.14.0 — Trusted Publishing will fail'); process.exit(1); }
+          "
 
       # `n8n-workflow` pulls in `isolated-vm`, a native addon whose postinstall
       # compiles C++. We only need its type declarations, so skip install scripts
