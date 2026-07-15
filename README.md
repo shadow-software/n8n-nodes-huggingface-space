@@ -107,26 +107,36 @@ Every field below is set through the node's real UI — dropdowns and a text box
 expressions, no JSON. Wire a Manual Trigger into the node, pick a category and model,
 write a prompt, click **Execute workflow**.
 
+**Image — a "Shadowman" logo mark** *(watch it run)*
+
+<p align="center">
+  <a href="https://shadowsoftware.com/assets/videos/n8n-node-demos/demo-shadowman.mp4">
+    <img src="https://shadowsoftware.com/assets/images/n8n-node-demos/demo-shadowman.gif" alt="Live demo: open the Hugging Face Space node, set Category/Model/Prompt, execute, and get a Shadowman logo" width="700">
+  </a>
+</p>
+<p align="center">
+  <a href="https://shadowsoftware.com/assets/videos/n8n-node-demos/demo-shadowman.mp4">▶ Full video (MP4)</a>
+  ·
+  <a href="https://shadowsoftware.com/assets/images/n8n-node-demos/demo-shadowman.mp4">same file under /assets/images</a>
+</p>
+
+Open the node → pick **Image** + **SDXL** → write the prompt → execute:
+
+<p align="center"><img src="https://shadowsoftware.com/assets/images/n8n-node-demos/demo-shadowman-config.png" alt="Node UI open: Category Image, Model SDXL, Shadowman prompt filled in" width="700"></p>
+<p align="center"><img src="https://shadowsoftware.com/assets/images/n8n-node-demos/demo-shadowman-green-run-live.png" alt="Successful run: workflow green, Generate Shadowman succeeded" width="700"></p>
+<p align="center"><img src="https://shadowsoftware.com/assets/images/n8n-node-demos/demo-shadowman-generated-live.png" alt="The generated Shadowman logo: silhouette dissolving into green light on black" width="420"></p>
+
+SDXL's catalog entry includes a CPU-only fallback Space with zero GPU-quota cost, so
+this image demo can run green without a Hugging Face PRO token.
+
 **Text (LLM) — a short blog post about AEO**
 
-<p align="center"><img src="docs/demo-aeo-blog-canvas.png" alt="AEO blog demo workflow: Manual Trigger into Hugging Face Space" width="700"></p>
-<p align="center"><img src="docs/demo-aeo-blog-config.png" alt="Node configuration: Category Text (LLM), Model Llama 3.2 3B Instruct, Prompt asking for a short AEO blog post" width="700"></p>
+<p align="center"><img src="https://shadowsoftware.com/assets/images/n8n-node-demos/demo-aeo-blog-canvas.png" alt="AEO blog demo workflow: Manual Trigger into Hugging Face Space" width="700"></p>
+<p align="center"><img src="https://shadowsoftware.com/assets/images/n8n-node-demos/demo-aeo-blog-config.png" alt="Node configuration: Category Text (LLM), Model Llama 3.2 3B Instruct, Prompt asking for a short AEO blog post" width="700"></p>
 
 Community text-generation Spaces are the most heavily used on Hugging Face and the
 first to queue or error under load — this exact config returns a real blog post
 once the underlying Space has room, with no changes needed.
-
-**Image — a "Shadowman" logo mark**
-
-<p align="center"><img src="docs/demo-shadowman-canvas.png" alt="Shadowman logo demo workflow: Manual Trigger into Hugging Face Space" width="700"></p>
-<p align="center"><img src="docs/demo-shadowman-config.png" alt="Node configuration: Category Image, Model SDXL, Prompt describing a shadow-silhouette logo mark" width="700"></p>
-<p align="center"><img src="docs/demo-shadowman-green-run.png" alt="Successful execution: both nodes green-checked, Succeeded in 9.024s" width="700"></p>
-<p align="center"><img src="docs/demo-shadowman-output.png" alt="The generated Shadowman logo: a black silhouette head and shoulders dissolving into green light particles" width="420"></p>
-
-Both demos use free-tier models (no Hugging Face PRO token required) — SDXL's catalog
-entry includes a CPU-only fallback Space with zero GPU-quota cost, which is what
-actually rendered the logo above, and is also why the image demo above ran green on
-the first try while the text demo's live availability varies with community-Space load.
 
 ## Models
 
