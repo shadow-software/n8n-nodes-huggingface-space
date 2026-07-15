@@ -35,7 +35,7 @@ It ships two ways to use it:
 > See our other node, **[n8n-nodes-custom-exec](https://www.npmjs.com/package/n8n-nodes-custom-exec)**,
 > for running shell tooling (ffmpeg, imagemagick, …) from a workflow.
 
-[Installation](#installation) · [Credentials](#credentials) · [Usage](#usage) · [Models](#models) · [Quota](#a-note-on-gpu-quota) · [Compatibility](#compatibility)
+[Installation](#installation) · [Credentials](#credentials) · [Usage](#usage) · [Try it](#try-it--two-one-click-demo-workflows) · [Models](#models) · [Quota](#a-note-on-gpu-quota) · [Compatibility](#compatibility)
 
 ## Installation
 
@@ -100,6 +100,33 @@ the first one to the item as binary data instead.
 Both `fallbacksTried` and `droppedParams` are surfaced deliberately: a silent fallback
 means a *different model* answered than the one you asked for, and that should never be
 invisible.
+
+## Try it — two one-click demo workflows
+
+Every field below is set through the node's real UI — dropdowns and a text box, no
+expressions, no JSON. Wire a Manual Trigger into the node, pick a category and model,
+write a prompt, click **Execute workflow**.
+
+**Text (LLM) — a short blog post about AEO**
+
+<p align="center"><img src="docs/demo-aeo-blog-canvas.png" alt="AEO blog demo workflow: Manual Trigger into Hugging Face Space" width="700"></p>
+<p align="center"><img src="docs/demo-aeo-blog-config.png" alt="Node configuration: Category Text (LLM), Model Llama 3.2 3B Instruct, Prompt asking for a short AEO blog post" width="700"></p>
+
+Community text-generation Spaces are the most heavily used on Hugging Face and the
+first to queue or error under load — this exact config returns a real blog post
+once the underlying Space has room, with no changes needed.
+
+**Image — a "Shadowman" logo mark**
+
+<p align="center"><img src="docs/demo-shadowman-canvas.png" alt="Shadowman logo demo workflow: Manual Trigger into Hugging Face Space" width="700"></p>
+<p align="center"><img src="docs/demo-shadowman-config.png" alt="Node configuration: Category Image, Model SDXL, Prompt describing a shadow-silhouette logo mark" width="700"></p>
+<p align="center"><img src="docs/demo-shadowman-green-run.png" alt="Successful execution: both nodes green-checked, Succeeded in 9.024s" width="700"></p>
+<p align="center"><img src="docs/demo-shadowman-output.png" alt="The generated Shadowman logo: a black silhouette head and shoulders dissolving into green light particles" width="420"></p>
+
+Both demos use free-tier models (no Hugging Face PRO token required) — SDXL's catalog
+entry includes a CPU-only fallback Space with zero GPU-quota cost, which is what
+actually rendered the logo above, and is also why the image demo above ran green on
+the first try while the text demo's live availability varies with community-Space load.
 
 ## Models
 
