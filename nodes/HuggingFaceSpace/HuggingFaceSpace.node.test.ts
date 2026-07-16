@@ -1,16 +1,17 @@
-import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
-
 // Mock n8n-workflow so the test needs no n8n install (same idiom as CustomExecNode's test).
 vi.mock('n8n-workflow', () => {
 	class NodeOperationError extends Error {
 		context: unknown;
-		constructor(_node: unknown, message: string, context?: unknown) {
-			super(message);
+		constructor(_node: unknown, messageOrError: string | Error, context?: unknown) {
+			super(typeof messageOrError === 'string' ? messageOrError : messageOrError.message);
 			this.name = 'NodeOperationError';
 			this.context = context;
 		}
 	}
-	return { NodeOperationError };
+	return {
+		NodeOperationError,
+		NodeConnectionTypes: { Main: 'main' },
+	};
 });
 
 import {

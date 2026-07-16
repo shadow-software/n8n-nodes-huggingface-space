@@ -58,6 +58,12 @@ module.exports = {
 			files: ['./nodes/**/*.ts'],
 			plugins: ['eslint-plugin-n8n-nodes-base'],
 			extends: ['plugin:n8n-nodes-base/nodes'],
+			rules: {
+				// n8n's community-node manual review requires NodeConnectionTypes.Main
+				// instead of the 'main' string literal these rules prefer.
+				'n8n-nodes-base/node-class-description-inputs-wrong-regular-node': 'off',
+				'n8n-nodes-base/node-class-description-outputs-wrong': 'off',
+			},
 		},
 		{
 			// catalog.ts is a DATA module (a list of Hugging Face models), not a node

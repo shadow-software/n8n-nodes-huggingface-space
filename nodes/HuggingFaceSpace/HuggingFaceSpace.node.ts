@@ -7,6 +7,7 @@ import {
 	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
+	NodeConnectionTypes,
 	NodeOperationError,
 	type FieldType,
 	type ResourceMapperField,
@@ -145,7 +146,7 @@ export class HuggingFaceSpace implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Hugging Face Space',
 		name: 'huggingFaceSpace',
-		icon: 'file:huggingFaceSpace.svg',
+		icon: { light: 'file:huggingFaceSpace.svg', dark: 'file:huggingFaceSpaceDark.svg' },
 		group: ['transform'],
 		version: 1,
 		subtitle:
@@ -155,8 +156,9 @@ export class HuggingFaceSpace implements INodeType {
 		defaults: {
 			name: 'Hugging Face Space',
 		},
-		inputs: ['main'],
-		outputs: ['main'],
+		inputs: [NodeConnectionTypes.Main],
+		outputs: [NodeConnectionTypes.Main],
+		usableAsTool: true,
 		credentials: [
 			{
 				name: 'huggingFaceSpaceApi',
@@ -654,8 +656,7 @@ export class HuggingFaceSpace implements INodeType {
 					});
 					continue;
 				}
-				if (err instanceof NodeOperationError) throw err;
-				throw new NodeOperationError(this.getNode(), describeError(err), { itemIndex });
+				throw new NodeOperationError(this.getNode(), err as Error, { itemIndex });
 			}
 		}
 
