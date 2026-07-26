@@ -302,16 +302,20 @@ describe('HuggingFaceSpace.execute', () => {
 		expect(JSON.parse(joinCall[1].body).data).toEqual(['x']);
 	});
 
-	test('positional mode rejects a non-array (including malformed JSON)', async () => {
+	test('positional mode rejects valid JSON that is not an array', async () => {
 		const ctx = makeCtx({
 			params: { ...BASE_PARAMS, inputMode: 'positional', positionalData: '{"a":1}' },
 		});
 		await expect(run(ctx)).rejects.toThrow(/Positional arguments must be a JSON array/);
+	});
 
-		const ctx2 = makeCtx({
+	test('positional mode rejects malformed JSON with a syntax-error message, not the array message', async () => {
+		// A missing bracket needs a different fix than "wrap it in []" — quoting the
+		// bad string here saves a guess at what's actually wrong.
+		const ctx = makeCtx({
 			params: { ...BASE_PARAMS, inputMode: 'positional', positionalData: '[broken' },
 		});
-		await expect(run(ctx2)).rejects.toThrow(/Positional arguments must be a JSON array/);
+		await expect(run(ctx)).rejects.toThrow(/is not valid JSON: "\[broken"/);
 	});
 
 	test('empty space and empty apiName are rejected before any network call', async () => {
@@ -996,6 +1000,20 @@ describe('HuggingFaceSpace.execute — catalog mode', () => {
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
+	test('a zero timeout is rejected before any network call, not left to fail as "Timed out after 0s"', async () => {
+		await expect(
+			run(makeCtx({ params: { ...CATALOG_PARAMS, timeout: 0 } })),
+		).rejects.toThrow(/Timeout \(Seconds\) must be a positive number, got 0/);
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	test('a negative timeout is rejected before any network call', async () => {
+		await expect(
+			run(makeCtx({ params: { ...CATALOG_PARAMS, timeout: -5 } })),
+		).rejects.toThrow(/Timeout \(Seconds\) must be a positive number, got -5/);
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
 	test('an unknown model id is rejected', async () => {
 		await expect(
 			run(makeCtx({ params: { ...CATALOG_PARAMS, model_image: 'nope' } })),
@@ -1095,6 +1113,33 @@ describe('HuggingFaceSpace.execute — catalog mode', () => {
 		expect(err.message).toMatch(/exceeded your free ZeroGPU quota/);
 		expect(err.message).toMatch(/limit on your Hugging Face account/);
 		expect(err.message).not.toMatch(/remaining fallback Space/);
+	});
+
+	// The catalog already knows ltx-video needs a paid HF token (requiresPaidGpu).
+	// "wait for the daily reset" is actively wrong advice there — no free-tier
+	// wait ever gives a free/anonymous token enough quota for it.
+	test('a quota error on a requiresPaidGpu model explains a wait will never help', async () => {
+		fetchSpy = makeCatalogFetch({ behaviour: { 'Lightricks/ltx-video-distilled': 'quota' } });
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const err = await run(
+			makeCtx({ params: { ...CATALOG_PARAMS, category: 'video', model_video: 'ltx-video' } }),
+		).catch((e) => e);
+		expect(err.message).toMatch(/exceeded your free ZeroGPU quota/);
+		expect(err.message).toMatch(/limit on your Hugging Face account/);
+		expect(err.message).toMatch(/needs a paid HF token/);
+		expect(err.message).toMatch(/free\/anonymous token will never have enough quota/);
+	});
+
+	// A model with no requiresPaidGpu hint must not gain the paid-token note —
+	// most quota failures ARE just "wait for the reset", and that must stay true.
+	test('a quota error on an ordinary (non-paid-GPU) model does not mention a paid token', async () => {
+		fetchSpy = makeCatalogFetch({ behaviour: { 'black-forest-labs/FLUX.2-dev': 'quota' } });
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const err = await run(makeCtx({ params: CATALOG_PARAMS })).catch((e) => e);
+		expect(err.message).toMatch(/limit on your Hugging Face account/);
+		expect(err.message).not.toMatch(/needs a paid HF token/);
 	});
 
 	// If the quota-free Space ALSO fails, the chain is genuinely exhausted and the

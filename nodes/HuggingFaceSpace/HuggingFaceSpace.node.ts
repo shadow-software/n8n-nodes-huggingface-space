@@ -344,6 +344,7 @@ export class HuggingFaceSpace implements INodeType {
 				name: 'timeout',
 				type: 'number',
 				default: 300,
+				typeOptions: { minValue: 1 },
 				description:
 					'Wall-clock budget covering both the queue wait and the generation. Free ZeroGPU Spaces can queue for minutes when busy.',
 			},
@@ -476,6 +477,17 @@ export class HuggingFaceSpace implements INodeType {
 			try {
 				const source = this.getNodeParameter('source', itemIndex, 'catalog') as string;
 				const timeout = this.getNodeParameter('timeout', itemIndex, 300) as number;
+				if (!Number.isFinite(timeout) || timeout <= 0) {
+					// timeoutMs=0 (or negative) would fail the very first loop check in
+					// predict() before a single SSE frame is read, reporting "Timed out
+					// after 0s" — technically true but useless for diagnosing a typo'd
+					// field. Catch it here with a message that names the actual mistake.
+					throw new NodeOperationError(
+						this.getNode(),
+						`Timeout (Seconds) must be a positive number, got ${timeout}`,
+						{ itemIndex },
+					);
+				}
 				const additionalOptions = this.getNodeParameter('additionalOptions', itemIndex, {}) as {
 					download?: boolean;
 					binaryProperty?: string;
@@ -491,6 +503,8 @@ export class HuggingFaceSpace implements INodeType {
 				/** Set only in custom+positional mode, where the user supplies the raw array. */
 				let positional: unknown[] | undefined;
 				let modelName = '';
+				/** Catalog mode only: see FallbackRun.requiresPaidGpuHint for why this is threaded through. */
+				let requiresPaidGpuHint: string | undefined;
 				/** Set only in custom+named mode. See its assignment below for what it guards. */
 				let requireAllParams = false;
 
@@ -506,6 +520,7 @@ export class HuggingFaceSpace implements INodeType {
 						);
 					}
 					modelName = model.name;
+					requiresPaidGpuHint = model.requiresPaidGpu;
 					if (!model.spaces.length) {
 						// catalog.test.ts enforces that every space-less model carries an
 						// `unavailable` reason, so this is never blank.
@@ -561,15 +576,38 @@ export class HuggingFaceSpace implements INodeType {
 
 					if (inputMode === 'positional') {
 						const raw = this.getNodeParameter('positionalData', itemIndex, '[]');
-						const parsed = typeof raw === 'string' ? safeJsonParse(raw) : raw;
-						if (!Array.isArray(parsed)) {
+						if (typeof raw === 'string') {
+							const trimmed = raw.trim();
+							const parsed = safeJsonParse(trimmed);
+							if (parsed === undefined) {
+								// Distinct from "parsed but wasn't an array" below — a syntax
+								// error (missing bracket, trailing comma) needs a different fix
+								// than a value error, and quoting the bad string saves a guess.
+								// (A literal JSON `null` also parses to a defined value, so this
+								// branch is syntax failures only, never a legitimate null.)
+								throw new NodeOperationError(
+									this.getNode(),
+									`Positional Arguments is not valid JSON: ${JSON.stringify(trimmed.slice(0, 80))}`,
+									{ itemIndex },
+								);
+							}
+							if (!Array.isArray(parsed)) {
+								throw new NodeOperationError(
+									this.getNode(),
+									'Positional arguments must be a JSON array',
+									{ itemIndex },
+								);
+							}
+							positional = parsed;
+						} else if (!Array.isArray(raw)) {
 							throw new NodeOperationError(
 								this.getNode(),
 								'Positional arguments must be a JSON array',
 								{ itemIndex },
 							);
+						} else {
+							positional = raw;
 						}
-						positional = parsed;
 					} else {
 						const mapped = this.getNodeParameter('namedParameters.value', itemIndex, {}) as Record<
 							string,
@@ -595,6 +633,7 @@ export class HuggingFaceSpace implements INodeType {
 					candidates,
 					provided,
 					positional,
+					requiresPaidGpuHint,
 					// Only catalog mode walks a chain of differing schemas; in custom
 					// mode an unknown parameter name is a typo and should still throw.
 					dropUnknownParams: source === 'catalog',
@@ -695,6 +734,13 @@ interface FallbackRun {
 	token?: string;
 	fetcher: Fetcher;
 	timeoutMs: number;
+	/**
+	 * Catalog mode only: the catalog already knows THIS model needs a paid HF
+	 * token (see catalog.ts requiresPaidGpu) — so when every candidate rejects
+	 * with quota exhaustion, "wait for the daily reset" is actively wrong advice
+	 * for a free/anonymous caller. Appended to the final error when set.
+	 */
+	requiresPaidGpuHint?: string;
 }
 
 /**
@@ -714,7 +760,7 @@ async function runWithFallbacks(opts: FallbackRun): Promise<{
 	attempts: Array<{ space: string; error: string }>;
 	droppedParams: Array<{ space: string; param: string }>;
 }> {
-	const { provided, positional, token, fetcher, timeoutMs, itemIndex } = opts;
+	const { provided, positional, token, fetcher, timeoutMs, itemIndex, requiresPaidGpuHint } = opts;
 	const attempts: Array<{ space: string; error: string }> = [];
 	const droppedParams: Array<{ space: string; param: string }> = [];
 
@@ -854,10 +900,17 @@ async function runWithFallbacks(opts: FallbackRun): Promise<{
 						? `\n\nThe ${gpuBound.length} remaining fallback Space(s) were skipped because they also run ` +
 							`on ZeroGPU and would fail the same way: ${gpuBound.map((c) => c.space).join(', ')}.`
 						: '';
+					// "wait for the daily reset" is actively wrong advice when the catalog
+					// already knows this model needs a paid HF token — no free-tier wait
+					// fixes that, so say so instead of sending the caller in a circle.
+					const paidGpuNote = requiresPaidGpuHint
+						? `\n\nThis model needs a paid HF token: ${requiresPaidGpuHint} A free/anonymous token will ` +
+							`never have enough quota for it, no matter how long you wait.`
+						: '';
 					throw new NodeOperationError(
 						opts.node,
 						`${message}\n\nThis is a limit on your Hugging Face account, not on this Space. Attach a ` +
-							`Hugging Face token credential with more quota, or wait for the daily reset.${alsoSkipped}`,
+							`Hugging Face token credential with more quota, or wait for the daily reset.${alsoSkipped}${paidGpuNote}`,
 						{ itemIndex },
 					);
 				}
