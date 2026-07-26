@@ -733,6 +733,22 @@ describe('HuggingFaceSpace.execute', () => {
 		expect(dl[1].headers.Authorization).toBeUndefined();
 	});
 
+	// A raw fetch() TypeError hides its real cause (e.g. ENOTFOUND) in .cause —
+	// the final catch-all must preserve it via describeError(), not just read
+	// err.message and lose everything but "fetch failed".
+	test('the final catch-all unwraps a fetch TypeError\'s cause chain, not just its bare message', async () => {
+		const cause = Object.assign(new Error('getaddrinfo ENOTFOUND some-space.hf.space'), { code: 'ENOTFOUND' });
+		fetchSpy = vi.fn(async () => {
+			throw Object.assign(new TypeError('fetch failed'), { cause });
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const err = await run(makeCtx({ params: BASE_PARAMS })).catch((e) => e);
+		expect(err.name).toBe('NodeOperationError');
+		expect(err.message).toMatch(/fetch failed/);
+		expect(err.message).toMatch(/ENOTFOUND/);
+	});
+
 	test('processes multiple items independently', async () => {
 		const ctx = makeCtx({
 			items: [{ json: { n: 1 } }, { json: { n: 2 } }],

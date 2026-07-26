@@ -692,7 +692,8 @@ export class HuggingFaceSpace implements INodeType {
 					});
 					continue;
 				}
-				throw new NodeOperationError(this.getNode(), err as Error, { itemIndex });
+				if (err instanceof NodeOperationError) throw err;
+				throw new NodeOperationError(this.getNode(), describeError(err), { itemIndex });
 			}
 		}
 
