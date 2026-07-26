@@ -530,6 +530,55 @@ describe('predict', () => {
 		);
 	});
 
+	// BUG: predict()'s timeout budget is only re-checked in the `for (;;)` loop
+	// AFTER `await reader.read()` resolves — see the `if (now() - started >
+	// timeoutMs)` check at the top of the loop body. If the underlying stream
+	// genuinely stalls (TCP connection stays open, no more bytes, no FIN, no
+	// error — a silent hang, as opposed to the "keeps emitting frames but never
+	// completes" case the other timeout tests exercise), `reader.read()` never
+	// resolves and the loop blocks on it forever. `timeoutMs` is configuration
+	// that is silently NOT enforced in this case: nothing wraps the read itself
+	// in an AbortController or Promise.race, unlike downloadResultFile() in
+	// HuggingFaceSpace.node.ts, which DOES bound its fetch with an
+	// AbortController + setTimeout. This test proves the hang is real by racing
+	// predict() against a short real-time timer — if predict() enforced its own
+	// budget, this resolves via the 'TIMED_OUT_AS_EXPECTED' rejection well
+	// before the outer 2s guard; instead it hangs past it.
+	test.fails(
+		'BUG: a stream that genuinely never emits another chunk is NOT bounded by timeoutMs (reader.read() hangs forever)',
+		async () => {
+			const fetcher = vi.fn(async (url: string) => {
+				if (url.includes('/queue/join')) return jsonResponse({ event_id: 'e' });
+				return {
+					ok: true,
+					status: 200,
+					body: {
+						getReader: () => ({
+							// Never resolves — simulates a stalled connection with no more
+							// bytes, no close, no error. The real-world case a load-bearing
+							// timeout is supposed to guard against.
+							read: () => new Promise(() => {}),
+							cancel: async () => undefined,
+						}),
+					},
+				} as unknown as Response;
+			}) as unknown as Fetcher;
+
+			const outcome = await Promise.race([
+				predict({ ...base, fetcher, timeoutMs: 50 }).then(
+					() => 'RESOLVED',
+					(e) => `REJECTED:${(e as Error).message}`,
+				),
+				new Promise((resolve) => setTimeout(() => resolve('STILL_HANGING_AFTER_2S'), 2000)),
+			]);
+
+			// Expected (correct) behavior: predict() rejects with a timeout error
+			// well within 2s, because timeoutMs was 50ms. Actual (buggy) behavior:
+			// the race resolves via the 2s guard because predict() never returns.
+			expect(outcome).toMatch(/^REJECTED:Timed out after/);
+		},
+	);
+
 	test('a connection drop mid-stream surfaces the underlying network error and still cancels the reader', async () => {
 		let cancelled = false;
 		const fetcher = vi.fn(async (url: string) => {

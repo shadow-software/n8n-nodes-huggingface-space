@@ -653,6 +653,51 @@ describe('HuggingFaceSpace.execute', () => {
 		expect(fileCalls).toBe(1);
 	});
 
+	// A hung file-server connection must not hang the whole n8n execution
+	// indefinitely. downloadResultFile's AbortController is the only thing that
+	// bounds this: a fetch that never resolves on its own must still be aborted
+	// at DOWNLOAD_TIMEOUT_MS (60s) by the timer firing controller.abort(), which
+	// rejects the pending promise with an AbortError. Without a REAL abort wired
+	// up (e.g. if `signal` were accepted but never passed through to fetch, or
+	// the timer were dead code), this fetch would simply never settle and the
+	// test — and a real execution — would hang forever.
+	test('a download that never resolves is aborted at the timeout, not left to hang forever', async () => {
+		vi.useFakeTimers();
+		let fileCalls = 0;
+		let capturedSignal: AbortSignal | undefined;
+		fetchSpy = vi.fn(async (url: string, init?: RequestInit) => {
+			if (String(url).includes('file=')) {
+				fileCalls++;
+				capturedSignal = init?.signal ?? undefined;
+				// Simulate a stalled connection: a promise that only ever settles if
+				// the caller's AbortSignal actually fires.
+				return new Promise((_resolve, reject) => {
+					capturedSignal?.addEventListener('abort', () => {
+						reject(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }));
+					});
+				}) as Promise<Response>;
+			}
+			if (String(url).endsWith('/config')) return jsonRes(CONFIG);
+			if (String(url).includes('/info')) return jsonRes(INFO);
+			if (String(url).includes('/queue/join')) return jsonRes({ event_id: 'e' });
+			return sseRes([COMPLETED]);
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const ctx = makeCtx({ params: { ...BASE_PARAMS, additionalOptions: { download: true } } });
+		const pending = run(ctx).catch((e) => e);
+		await vi.runAllTimersAsync();
+		const err = await pending;
+		vi.useRealTimers();
+
+		expect(capturedSignal).toBeInstanceOf(AbortSignal);
+		expect(err.name).toBe('NodeOperationError');
+		expect(err.message).toMatch(/Timed out downloading result file/);
+		expect(err.message).toMatch(/after 3 attempts/);
+		// Each of the 3 attempts hangs and gets aborted independently.
+		expect(fileCalls).toBe(3);
+	});
+
 	test('a 200 with an empty body retries, then succeeds once real bytes arrive', async () => {
 		// Guardrail: a proxy can return a 200 carrying a tiny error stub. The
 		// Space's file route can genuinely still be flushing to disk right after
