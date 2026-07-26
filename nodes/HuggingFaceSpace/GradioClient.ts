@@ -169,6 +169,49 @@ function authHeaders(token?: string): Record<string, string> {
 	return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A status worth a quick retry before falling through to the next fallback Space. */
+function isTransientStatus(status: number): boolean {
+	return status === 502 || status === 503 || status === 504;
+}
+
+const CONFIG_INFO_RETRY_ATTEMPTS = 3;
+const CONFIG_INFO_RETRY_DELAY_MS = 500;
+
+/**
+ * Retry a /config or /info fetch a couple of times on a transient 502/503/504
+ * before giving up.
+ *
+ * Without this, a single momentary blip on either read — before any GPU work
+ * has even started — burned the candidate as a permanent failure in
+ * runWithFallbacks() and skipped straight to the next fallback Space, even
+ * though the candidate itself was healthy. 429 is deliberately excluded: it
+ * already carries its own actionable rate-limit message (see
+ * rateLimitMessage()) and retrying it immediately would just trip the limit
+ * again.
+ */
+async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
+	let lastErr: unknown;
+	for (let attempt = 1; attempt <= CONFIG_INFO_RETRY_ATTEMPTS; attempt++) {
+		try {
+			return await fn();
+		} catch (err) {
+			lastErr = err;
+			const status = (err as { status?: number }).status;
+			if (attempt === CONFIG_INFO_RETRY_ATTEMPTS || typeof status !== 'number' || !isTransientStatus(status)) {
+				throw err;
+			}
+			await sleep(CONFIG_INFO_RETRY_DELAY_MS * attempt);
+		}
+	}
+	// Unreachable: the loop above always returns or throws.
+	/* c8 ignore next */
+	throw lastErr;
+}
+
 /**
  * Rate-limit responses need a distinct message from a generic 5xx: the fix is
  * "wait" or "add a token", not "the Space is broken." Detected ahead of the
@@ -196,21 +239,31 @@ async function parseJsonResponse<T>(res: Response, url: string): Promise<T> {
 	}
 }
 
+/** Attach the HTTP status to an Error so withTransientRetry() can decide whether to retry it. */
+function withStatus(err: Error, status: number): Error {
+	return Object.assign(err, { status });
+}
+
 export async function fetchConfig(
 	host: string,
 	fetcher: Fetcher,
 	token?: string,
 ): Promise<GradioConfig> {
 	const url = `${host}/config`;
-	const res = await fetcher(url, { headers: authHeaders(token) });
-	if (!res.ok) {
-		throw new Error(
-			rateLimitMessage(url, res.status) ??
-				`Could not read Gradio config from ${url} (HTTP ${res.status}). ` +
-					`Is the Space public, awake, and a Gradio Space?`,
-		);
-	}
-	return parseJsonResponse<GradioConfig>(res, url);
+	return withTransientRetry(async () => {
+		const res = await fetcher(url, { headers: authHeaders(token) });
+		if (!res.ok) {
+			throw withStatus(
+				new Error(
+					rateLimitMessage(url, res.status) ??
+						`Could not read Gradio config from ${url} (HTTP ${res.status}). ` +
+							`Is the Space public, awake, and a Gradio Space?`,
+				),
+				res.status,
+			);
+		}
+		return parseJsonResponse<GradioConfig>(res, url);
+	});
 }
 
 export async function fetchInfo(
@@ -220,11 +273,16 @@ export async function fetchInfo(
 	token?: string,
 ): Promise<GradioInfo> {
 	const url = `${host}${apiPrefix}/info`;
-	const res = await fetcher(url, { headers: authHeaders(token) });
-	if (!res.ok) {
-		throw new Error(rateLimitMessage(url, res.status) ?? `Could not read API schema from ${url} (HTTP ${res.status})`);
-	}
-	return parseJsonResponse<GradioInfo>(res, url);
+	return withTransientRetry(async () => {
+		const res = await fetcher(url, { headers: authHeaders(token) });
+		if (!res.ok) {
+			throw withStatus(
+				new Error(rateLimitMessage(url, res.status) ?? `Could not read API schema from ${url} (HTTP ${res.status})`),
+				res.status,
+			);
+		}
+		return parseJsonResponse<GradioInfo>(res, url);
+	});
 }
 
 /**

@@ -685,6 +685,35 @@ describe('fetchConfig', () => {
 			/Expected JSON from .*non-JSON body.*maintenance/s,
 		);
 	});
+
+	test('retries a transient 503 and succeeds once the Space recovers', async () => {
+		let calls = 0;
+		const fetcher = vi.fn(async () => {
+			calls++;
+			return calls < 3 ? jsonResponse({}, false, 503) : jsonResponse(CONFIG);
+		}) as unknown as Fetcher;
+		const got = await fetchConfig('https://x.hf.space', fetcher);
+		expect(got).toEqual(CONFIG);
+		expect(calls).toBe(3);
+	});
+
+	test('gives up after exhausting retries on a persistent 502', async () => {
+		const fetcher = vi.fn(async () => jsonResponse({}, false, 502)) as unknown as Fetcher;
+		await expect(fetchConfig('https://x.hf.space', fetcher)).rejects.toThrow(/HTTP 502/);
+		expect((fetcher as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(3);
+	});
+
+	test('does not retry a 404 — it is not transient', async () => {
+		const fetcher = vi.fn(async () => jsonResponse({}, false, 404)) as unknown as Fetcher;
+		await expect(fetchConfig('https://x.hf.space', fetcher)).rejects.toThrow(/HTTP 404/);
+		expect((fetcher as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+	});
+
+	test('does not retry a 429 — rate limiting needs a real wait, not an immediate retry', async () => {
+		const fetcher = vi.fn(async () => textResponse('rate limited', false, 429)) as unknown as Fetcher;
+		await expect(fetchConfig('https://x.hf.space', fetcher)).rejects.toThrow(/Rate limited \(HTTP 429\)/);
+		expect((fetcher as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+	});
 });
 
 describe('fetchInfo', () => {
@@ -717,6 +746,18 @@ describe('fetchInfo', () => {
 		await expect(fetchInfo('https://x.hf.space', '', fetcher)).rejects.toThrow(
 			/Expected JSON from .*non-JSON body.*Service Unavailable/s,
 		);
+	});
+
+	test('retries a transient 504 and succeeds once the Space recovers', async () => {
+		const info = { named_endpoints: { '/generate': { parameters: [] } } };
+		let calls = 0;
+		const fetcher = vi.fn(async () => {
+			calls++;
+			return calls < 2 ? jsonResponse({}, false, 504) : jsonResponse(info);
+		}) as unknown as Fetcher;
+		const got = await fetchInfo('https://x.hf.space', '', fetcher);
+		expect(got).toEqual(info);
+		expect(calls).toBe(2);
 	});
 });
 
