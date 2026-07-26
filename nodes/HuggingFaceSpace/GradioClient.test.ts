@@ -31,12 +31,42 @@ function sseResponse(chunks: string[], ok = true, status = 200): Response {
 	return { ok, status, body } as unknown as Response;
 }
 
+/** An SSE stream whose connection drops (reader.read() rejects) after N good chunks. */
+function droppedSseResponse(chunks: string[], failAfter: number, cancelSpy?: () => void): Response {
+	const encoder = new TextEncoder();
+	let i = 0;
+	const body = {
+		getReader() {
+			return {
+				read: async () => {
+					if (i >= failAfter) throw Object.assign(new TypeError('terminated'), { code: 'ECONNRESET' });
+					if (i >= chunks.length) return { done: true, value: undefined };
+					return { done: false, value: encoder.encode(chunks[i++]) };
+				},
+				cancel: async () => {
+					cancelSpy?.();
+				},
+			};
+		},
+	};
+	return { ok: true, status: 200, body } as unknown as Response;
+}
+
 function jsonResponse(data: unknown, ok = true, status = 200): Response {
 	return {
 		ok,
 		status,
 		json: async () => data,
 		text: async () => JSON.stringify(data),
+	} as unknown as Response;
+}
+
+/** A response whose body is not JSON at all — an HTML maintenance/error page. */
+function textResponse(body: string, ok = true, status = 200): Response {
+	return {
+		ok,
+		status,
+		text: async () => body,
 	} as unknown as Response;
 }
 
@@ -430,6 +460,35 @@ describe('predict', () => {
 		await expect(predict({ ...base, fetcher })).rejects.toThrow(/event stream failed \(HTTP 500\)/);
 	});
 
+	test('a 429 on queue/join surfaces a rate-limit message, not a generic body dump', async () => {
+		const fetcher = vi.fn(async () => textResponse('Too Many Requests', false, 429)) as unknown as Fetcher;
+
+		await expect(predict({ ...base, fetcher })).rejects.toThrow(
+			/Rate limited \(HTTP 429\).*queue\/join.*wait before retrying, or add a Hugging Face token/s,
+		);
+	});
+
+	test('a 429 on the event stream surfaces a rate-limit message', async () => {
+		const fetcher = vi.fn(async (url: string) => {
+			if (url.includes('/queue/join')) return jsonResponse({ event_id: 'e' });
+			return textResponse('Too Many Requests', false, 429);
+		}) as unknown as Fetcher;
+
+		await expect(predict({ ...base, fetcher })).rejects.toThrow(
+			/Rate limited \(HTTP 429\).*queue\/data/s,
+		);
+	});
+
+	test('a non-JSON queue/join body raises a clear error instead of a bare SyntaxError', async () => {
+		const fetcher = vi.fn(async () =>
+			textResponse('<html><body>502 Bad Gateway</body></html>'),
+		) as unknown as Fetcher;
+
+		await expect(predict({ ...base, fetcher })).rejects.toThrow(
+			/Expected JSON from .*queue\/join.*non-JSON body.*502 Bad Gateway/s,
+		);
+	});
+
 	test('exceeding the timeout budget aborts with a quota/queue hint', async () => {
 		let t = 0;
 		const now = () => (t += 60_000); // each clock read jumps a minute
@@ -442,6 +501,46 @@ describe('predict', () => {
 		await expect(predict({ ...base, fetcher, timeoutMs: 120_000, now })).rejects.toThrow(
 			/Timed out after \d+s/,
 		);
+	});
+
+	test('a timeout after confirmed queue activity says so, not "hung"', async () => {
+		let t = 0;
+		const now = () => (t += 60_000);
+		const fetcher = vi.fn(async (url: string) => {
+			if (url.includes('/queue/join')) return jsonResponse({ event_id: 'e' });
+			return sseResponse(Array(20).fill('data: {"msg":"estimation"}\n\n'));
+		}) as unknown as Fetcher;
+
+		await expect(predict({ ...base, fetcher, timeoutMs: 120_000, now })).rejects.toThrow(
+			/confirmed it queued this request but did not finish in time/,
+		);
+	});
+
+	test('a timeout with zero frames received says the Space never confirmed activity', async () => {
+		let t = 0;
+		const now = () => (t += 60_000);
+		const fetcher = vi.fn(async (url: string) => {
+			if (url.includes('/queue/join')) return jsonResponse({ event_id: 'e' });
+			// Stream stays open (never `done`) but emits nothing at all.
+			return sseResponse(Array(20).fill(''));
+		}) as unknown as Fetcher;
+
+		await expect(predict({ ...base, fetcher, timeoutMs: 120_000, now })).rejects.toThrow(
+			/never confirmed it started processing this request.*sleeping, unreachable, or the queue itself is stuck/s,
+		);
+	});
+
+	test('a connection drop mid-stream surfaces the underlying network error and still cancels the reader', async () => {
+		let cancelled = false;
+		const fetcher = vi.fn(async (url: string) => {
+			if (url.includes('/queue/join')) return jsonResponse({ event_id: 'e' });
+			return droppedSseResponse(['data: {"msg":"estimation"}\n\n'], 1, () => {
+				cancelled = true;
+			});
+		}) as unknown as Fetcher;
+
+		await expect(predict({ ...base, fetcher })).rejects.toThrow(/terminated/);
+		expect(cancelled).toBe(true);
 	});
 
 	test('fetches /config itself when none is pre-supplied', async () => {
@@ -523,6 +622,20 @@ describe('fetchConfig', () => {
 		const headers = (fetcher as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].headers;
 		expect(headers.Authorization).toBe('Bearer hf_tok');
 	});
+
+	test('a 429 explains it is a rate limit, not a broken Space', async () => {
+		const fetcher = vi.fn(async () => textResponse('rate limited', false, 429)) as unknown as Fetcher;
+		await expect(fetchConfig('https://x.hf.space', fetcher)).rejects.toThrow(
+			/Rate limited \(HTTP 429\).*wait before retrying, or add a Hugging Face token/s,
+		);
+	});
+
+	test('a non-JSON body (e.g. an HTML error page) raises a clear error', async () => {
+		const fetcher = vi.fn(async () => textResponse('<html>maintenance</html>')) as unknown as Fetcher;
+		await expect(fetchConfig('https://x.hf.space', fetcher)).rejects.toThrow(
+			/Expected JSON from .*non-JSON body.*maintenance/s,
+		);
+	});
 });
 
 describe('fetchInfo', () => {
@@ -540,6 +653,20 @@ describe('fetchInfo', () => {
 		const fetcher = vi.fn(async () => jsonResponse({}, false, 503)) as unknown as Fetcher;
 		await expect(fetchInfo('https://x.hf.space', '', fetcher)).rejects.toThrow(
 			/Could not read API schema.*HTTP 503/,
+		);
+	});
+
+	test('a 429 explains it is a rate limit', async () => {
+		const fetcher = vi.fn(async () => textResponse('rate limited', false, 429)) as unknown as Fetcher;
+		await expect(fetchInfo('https://x.hf.space', '', fetcher)).rejects.toThrow(
+			/Rate limited \(HTTP 429\)/,
+		);
+	});
+
+	test('a non-JSON body raises a clear error', async () => {
+		const fetcher = vi.fn(async () => textResponse('Service Unavailable')) as unknown as Fetcher;
+		await expect(fetchInfo('https://x.hf.space', '', fetcher)).rejects.toThrow(
+			/Expected JSON from .*non-JSON body.*Service Unavailable/s,
 		);
 	});
 });

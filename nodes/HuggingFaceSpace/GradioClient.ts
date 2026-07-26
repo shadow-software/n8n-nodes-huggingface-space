@@ -169,19 +169,48 @@ function authHeaders(token?: string): Record<string, string> {
 	return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+/**
+ * Rate-limit responses need a distinct message from a generic 5xx: the fix is
+ * "wait" or "add a token", not "the Space is broken." Detected ahead of the
+ * generic !res.ok branches so callers see the more actionable message.
+ */
+function rateLimitMessage(url: string, status: number): string | null {
+	if (status !== 429) return null;
+	return `Rate limited (HTTP 429) calling ${url}. This is a per-caller limit on the Space or Hugging Face's ` +
+		`router, not a broken Space — wait before retrying, or add a Hugging Face token credential to raise the limit.`;
+}
+
+/**
+ * Parse a Response body as JSON, raising a clear error (naming the URL and a
+ * snippet of the actual body) instead of letting an HTML/maintenance page
+ * throw an opaque `SyntaxError` deep inside JSON.parse.
+ */
+async function parseJsonResponse<T>(res: Response, url: string): Promise<T> {
+	const text = await res.text();
+	try {
+		return JSON.parse(text) as T;
+	} catch {
+		throw new Error(
+			`Expected JSON from ${url} but got non-JSON body (HTTP ${res.status}): ${text.slice(0, 300) || '(empty body)'}`,
+		);
+	}
+}
+
 export async function fetchConfig(
 	host: string,
 	fetcher: Fetcher,
 	token?: string,
 ): Promise<GradioConfig> {
-	const res = await fetcher(`${host}/config`, { headers: authHeaders(token) });
+	const url = `${host}/config`;
+	const res = await fetcher(url, { headers: authHeaders(token) });
 	if (!res.ok) {
 		throw new Error(
-			`Could not read Gradio config from ${host}/config (HTTP ${res.status}). ` +
-				`Is the Space public, awake, and a Gradio Space?`,
+			rateLimitMessage(url, res.status) ??
+				`Could not read Gradio config from ${url} (HTTP ${res.status}). ` +
+					`Is the Space public, awake, and a Gradio Space?`,
 		);
 	}
-	return (await res.json()) as GradioConfig;
+	return parseJsonResponse<GradioConfig>(res, url);
 }
 
 export async function fetchInfo(
@@ -190,9 +219,12 @@ export async function fetchInfo(
 	fetcher: Fetcher,
 	token?: string,
 ): Promise<GradioInfo> {
-	const res = await fetcher(`${host}${apiPrefix}/info`, { headers: authHeaders(token) });
-	if (!res.ok) throw new Error(`Could not read API schema from ${host}${apiPrefix}/info (HTTP ${res.status})`);
-	return (await res.json()) as GradioInfo;
+	const url = `${host}${apiPrefix}/info`;
+	const res = await fetcher(url, { headers: authHeaders(token) });
+	if (!res.ok) {
+		throw new Error(rateLimitMessage(url, res.status) ?? `Could not read API schema from ${url} (HTTP ${res.status})`);
+	}
+	return parseJsonResponse<GradioInfo>(res, url);
 }
 
 /**
@@ -305,7 +337,10 @@ export async function predict(opts: PredictOptions): Promise<PredictResult> {
 		}),
 	});
 
+	const joinUrl = `${host}${prefix}/queue/join`;
 	if (!join.ok) {
+		const rateLimited = rateLimitMessage(joinUrl, join.status);
+		if (rateLimited) throw new Error(rateLimited);
 		const body = await join.text().catch(() => '');
 		throw new Error(
 			`Gradio queue/join failed (HTTP ${join.status}) for ${space} /${apiName.replace(/^\//, '')}: ` +
@@ -313,27 +348,36 @@ export async function predict(opts: PredictOptions): Promise<PredictResult> {
 		);
 	}
 
-	const joinBody = (await join.json()) as { event_id?: string };
+	const joinBody = await parseJsonResponse<{ event_id?: string }>(join, joinUrl);
 	const eventId = joinBody.event_id ?? '';
 
-	const sse = await fetcher(`${host}${prefix}/queue/data?session_hash=${encodeURIComponent(session)}`, {
+	const sseUrl = `${host}${prefix}/queue/data?session_hash=${encodeURIComponent(session)}`;
+	const sse = await fetcher(sseUrl, {
 		headers: { Accept: 'text/event-stream', ...authHeaders(token) },
 	});
 	if (!sse.ok || !sse.body) {
-		throw new Error(`Gradio event stream failed (HTTP ${sse.status}) for ${space}`);
+		const rateLimited = rateLimitMessage(sseUrl, sse.status);
+		throw new Error(rateLimited ?? `Gradio event stream failed (HTTP ${sse.status}) for ${space}`);
 	}
 
 	const reader = (sse.body as ReadableStream<Uint8Array>).getReader();
 	const decoder = new TextDecoder();
 	const logs: string[] = [];
 	let buffer = '';
+	// Did the Space ever confirm it is actually queueing/running this request?
+	// Distinguishes "genuinely slow — it's in the queue" from "silent from the
+	// first byte", which point at very different problems (busy vs. hung/dead).
+	let sawQueueActivity = false;
 
 	try {
 		for (;;) {
 			if (now() - started > timeoutMs) {
+				const activity = sawQueueActivity
+					? 'The Space confirmed it queued this request but did not finish in time.'
+					: 'The Space never confirmed it started processing this request (no estimation/progress frame arrived) — it may be sleeping, unreachable, or the queue itself is stuck.';
 				throw new Error(
 					`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${space} /${apiName.replace(/^\//, '')}. ` +
-						`Busy ZeroGPU Spaces can queue for a long time — raise the timeout or supply a Hugging Face token.`,
+						`${activity} Busy ZeroGPU Spaces can queue for a long time — raise the timeout or supply a Hugging Face token.`,
 				);
 			}
 
@@ -349,6 +393,16 @@ export async function predict(opts: PredictOptions): Promise<PredictResult> {
 
 			for (const frame of parseSseFrames(ready)) {
 				const msg = frame.msg as string | undefined;
+
+				if (
+					msg === 'estimation' ||
+					msg === 'process_starts' ||
+					msg === 'progress' ||
+					msg === 'log' ||
+					msg === 'heartbeat'
+				) {
+					sawQueueActivity = true;
+				}
 
 				if (msg === 'log' && typeof frame.log === 'string') {
 					logs.push(frame.log);
