@@ -580,9 +580,17 @@ describe('HuggingFaceSpace.execute', () => {
 	// A rejected fetch during the binary download surfaces as a PLAIN Error (not a
 	// NodeOperationError), so execute()'s catch must wrap it rather than leak an
 	// untyped error to n8n.
-	test('a raw network Error during file download is wrapped as a NodeOperationError', async () => {
+	// A rejected fetch during the binary download surfaces as a PLAIN Error (not a
+	// NodeOperationError), so execute()'s catch must wrap it rather than leak an
+	// untyped error to n8n. Retries exhaust (3 attempts) before it surfaces.
+	test('a raw network Error during file download retries then wraps as a NodeOperationError', async () => {
+		vi.useFakeTimers();
+		let fileCalls = 0;
 		fetchSpy = vi.fn(async (url: string) => {
-			if (String(url).includes('file=')) throw new Error('ECONNRESET');
+			if (String(url).includes('file=')) {
+				fileCalls++;
+				throw new Error('ECONNRESET');
+			}
 			if (String(url).endsWith('/config')) return jsonRes(CONFIG);
 			if (String(url).includes('/info')) return jsonRes(INFO);
 			if (String(url).includes('/queue/join')) return jsonRes({ event_id: 'e' });
@@ -593,9 +601,136 @@ describe('HuggingFaceSpace.execute', () => {
 		const ctx = makeCtx({
 			params: { ...BASE_PARAMS, additionalOptions: { download: true } },
 		});
-		const err = await run(ctx).catch((e) => e);
+		const pending = run(ctx).catch((e) => e);
+		await vi.runAllTimersAsync();
+		const err = await pending;
+		vi.useRealTimers();
+
 		expect(err.name).toBe('NodeOperationError');
 		expect(err.message).toMatch(/ECONNRESET/);
+		expect(err.message).toMatch(/after 3 attempts/);
+		expect(fileCalls).toBe(3);
+	});
+
+	test('a retryable download status (503) succeeds after retrying', async () => {
+		vi.useFakeTimers();
+		let fileCalls = 0;
+		fetchSpy = vi.fn(async (url: string) => {
+			if (String(url).includes('file=')) {
+				fileCalls++;
+				return fileCalls < 2 ? jsonRes({}, false, 503) : jsonRes({});
+			}
+			if (String(url).endsWith('/config')) return jsonRes(CONFIG);
+			if (String(url).includes('/info')) return jsonRes(INFO);
+			if (String(url).includes('/queue/join')) return jsonRes({ event_id: 'e' });
+			return sseRes([COMPLETED]);
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const ctx = makeCtx({
+			params: { ...BASE_PARAMS, additionalOptions: { download: true } },
+		});
+		const pending = run(ctx);
+		await vi.runAllTimersAsync();
+		const [out] = await pending;
+		vi.useRealTimers();
+
+		expect(out[0].binary?.data).toBeDefined();
+		expect(fileCalls).toBe(2);
+	});
+
+	test('a non-retryable download status (403) fails on the first attempt, no retry', async () => {
+		let fileCalls = 0;
+		fetchSpy = makeFetch({
+			'file=': () => {
+				fileCalls++;
+				return jsonRes({}, false, 403);
+			},
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+		const ctx = makeCtx({ params: { ...BASE_PARAMS, additionalOptions: { download: true } } });
+		await expect(run(ctx)).rejects.toThrow(/Failed to download result file.*HTTP 403/s);
+		expect(fileCalls).toBe(1);
+	});
+
+	test('a 200 with an empty body retries, then succeeds once real bytes arrive', async () => {
+		// Guardrail: a proxy can return a 200 carrying a tiny error stub. The
+		// Space's file route can genuinely still be flushing to disk right after
+		// process_completed — treat an empty body like a retryable status.
+		vi.useFakeTimers();
+		let fileCalls = 0;
+		fetchSpy = vi.fn(async (url: string) => {
+			if (String(url).includes('file=')) {
+				fileCalls++;
+				return {
+					ok: true,
+					status: 200,
+					arrayBuffer: async () => (fileCalls < 2 ? new ArrayBuffer(0) : new Uint8Array([1, 2, 3]).buffer),
+				} as unknown as Response;
+			}
+			if (String(url).endsWith('/config')) return jsonRes(CONFIG);
+			if (String(url).includes('/info')) return jsonRes(INFO);
+			if (String(url).includes('/queue/join')) return jsonRes({ event_id: 'e' });
+			return sseRes([COMPLETED]);
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const ctx = makeCtx({ params: { ...BASE_PARAMS, additionalOptions: { download: true } } });
+		const pending = run(ctx);
+		await vi.runAllTimersAsync();
+		const [out] = await pending;
+		vi.useRealTimers();
+
+		expect(out[0].binary?.data).toBeDefined();
+		expect(fileCalls).toBe(2);
+	});
+
+	test('a 200 with an empty body on every attempt fails with a clear 0-byte message', async () => {
+		vi.useFakeTimers();
+		let fileCalls = 0;
+		fetchSpy = vi.fn(async (url: string) => {
+			if (String(url).includes('file=')) {
+				fileCalls++;
+				return { ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(0) } as unknown as Response;
+			}
+			if (String(url).endsWith('/config')) return jsonRes(CONFIG);
+			if (String(url).includes('/info')) return jsonRes(INFO);
+			if (String(url).includes('/queue/join')) return jsonRes({ event_id: 'e' });
+			return sseRes([COMPLETED]);
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+
+		const ctx = makeCtx({ params: { ...BASE_PARAMS, additionalOptions: { download: true } } });
+		const pending = run(ctx).catch((e) => e);
+		await vi.runAllTimersAsync();
+		const err = await pending;
+		vi.useRealTimers();
+
+		expect(err.name).toBe('NodeOperationError');
+		expect(err.message).toMatch(/downloaded as 0 bytes after 3 attempts/);
+		expect(fileCalls).toBe(3);
+	});
+
+	test('the download bearer token is scoped to the Space\'s own host, not sent to other hosts', async () => {
+		const offHostUrl = 'https://cdn.example.com/files/image.png';
+		fetchSpy = makeFetch({
+			'/queue/data': () =>
+				sseRes([
+					`data: ${JSON.stringify({
+						msg: 'process_completed',
+						output: { data: [{ url: offHostUrl }] },
+						success: true,
+					})}\n\n`,
+				]),
+		});
+		vi.stubGlobal('fetch', fetchSpy);
+		const ctx = makeCtx({
+			params: { ...BASE_PARAMS, additionalOptions: { download: true } },
+			credential: { accessToken: 'hf_tok' },
+		});
+		await run(ctx);
+		const dl = fetchSpy.mock.calls.find((c) => String(c[0]) === offHostUrl)!;
+		expect(dl[1].headers.Authorization).toBeUndefined();
 	});
 
 	test('processes multiple items independently', async () => {

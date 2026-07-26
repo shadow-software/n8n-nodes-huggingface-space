@@ -669,17 +669,14 @@ export class HuggingFaceSpace implements INodeType {
 				if (additionalOptions.download && files.length) {
 					const binaryProperty = additionalOptions.binaryProperty || 'data';
 					const fileUrl = files[0];
-					const res = await fetcher(fileUrl, {
-						headers: token ? { Authorization: `Bearer ${token}` } : {},
+					const buffer = await downloadResultFile({
+						node: this.getNode(),
+						itemIndex,
+						fileUrl,
+						space: result.space,
+						token,
+						fetcher,
 					});
-					if (!res.ok) {
-						throw new NodeOperationError(
-							this.getNode(),
-							`Failed to download result file ${fileUrl} (HTTP ${res.status})`,
-							{ itemIndex },
-						);
-					}
-					const buffer = Buffer.from(await res.arrayBuffer());
 					const fileName = fileUrl.split('/').pop()?.split('?')[0] || 'output';
 					item.binary = {
 						[binaryProperty]: await this.helpers.prepareBinaryData(buffer, fileName),
@@ -701,6 +698,122 @@ export class HuggingFaceSpace implements INodeType {
 
 		return [returnData];
 	}
+}
+
+interface DownloadOptions {
+	node: INode;
+	itemIndex: number;
+	fileUrl: string;
+	/** The Space id ("owner/name" or a full host) the result came from, to scope the bearer token. */
+	space: string;
+	token?: string;
+	fetcher: Fetcher;
+}
+
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+const DOWNLOAD_RETRY_ATTEMPTS = 3;
+const DOWNLOAD_RETRY_DELAY_MS = 1_000;
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A status worth retrying: transient overload/rate-limit on the Space's own file route. */
+function isRetryableStatus(status: number): boolean {
+	return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+/**
+ * Download a generated result file with a bounded timeout and a short retry, and
+ * only attach the HF bearer token when the file is actually served from the
+ * Space's own host.
+ *
+ * Three failure modes were previously indistinguishable from "the Space is
+ * broken," and together they are what made this download step the most common
+ * source of "generation succeeded but I can't get the asset" reports:
+ *
+ *   1. No timeout — a stalled `.hf.space` file route (a free, shared, often
+ *      overloaded box) hung until the platform's default socket timeout, which
+ *      can exceed the whole workflow's execution budget and abort the run with
+ *      no useful error.
+ *   2. No retry — a momentary 429/502/503 on the file route (common right after
+ *      `process_completed`, before the file has finished flushing to disk on a
+ *      loaded Space) killed the entire item on one bad response.
+ *   3. The token was sent to EVERY returned file URL unconditionally. Some
+ *      Spaces proxy or redirect file serving through a different host (a CDN,
+ *      a mirror), and an unexpected `Authorization: Bearer …` header on THAT
+ *      host can get the request rejected outright rather than ignored. Scoping
+ *      the header to the Space's own host removes that as a failure cause.
+ */
+async function downloadResultFile(opts: DownloadOptions): Promise<Buffer> {
+	const { node, itemIndex, fileUrl, space, token, fetcher } = opts;
+
+	let sendToken = false;
+	try {
+		sendToken = new URL(fileUrl).host === new URL(spaceToHost(space)).host;
+	} catch {
+		// Malformed URL — let the fetch itself fail with a clear network error below.
+	}
+	const headers = token && sendToken ? { Authorization: `Bearer ${token}` } : {};
+
+	let lastErr: unknown;
+	for (let attempt = 1; attempt <= DOWNLOAD_RETRY_ATTEMPTS; attempt++) {
+		const isLastAttempt = attempt === DOWNLOAD_RETRY_ATTEMPTS;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+		try {
+			const res = await fetcher(fileUrl, { headers, signal: controller.signal } as RequestInit);
+			clearTimeout(timer);
+
+			if (!res.ok) {
+				if (!isLastAttempt && isRetryableStatus(res.status)) {
+					await sleep(DOWNLOAD_RETRY_DELAY_MS * attempt);
+					continue;
+				}
+				throw new NodeOperationError(
+					node,
+					`Failed to download result file ${fileUrl} (HTTP ${res.status})`,
+					{ itemIndex },
+				);
+			}
+
+			const buffer = Buffer.from(await res.arrayBuffer());
+			if (buffer.byteLength === 0) {
+				// A 200 with an empty body is the same "not finished flushing to disk"
+				// window the retry logic above exists for. Treat it as retryable
+				// rather than silently handing an empty file downstream.
+				if (!isLastAttempt) {
+					await sleep(DOWNLOAD_RETRY_DELAY_MS * attempt);
+					continue;
+				}
+				throw new NodeOperationError(
+					node,
+					`Result file ${fileUrl} downloaded as 0 bytes after ${DOWNLOAD_RETRY_ATTEMPTS} attempts ` +
+						`(HTTP ${res.status}). The Space likely hadn't finished writing the file yet, or a proxy ` +
+						`returned an empty success response.`,
+					{ itemIndex },
+				);
+			}
+			return buffer;
+		} catch (err) {
+			clearTimeout(timer);
+			if (err instanceof NodeOperationError) throw err;
+
+			lastErr = err;
+			if (isLastAttempt) break;
+			await sleep(DOWNLOAD_RETRY_DELAY_MS * attempt);
+		}
+	}
+
+	const timedOut = lastErr instanceof Error && lastErr.name === 'AbortError';
+	throw new NodeOperationError(
+		node,
+		timedOut
+			? `Timed out downloading result file ${fileUrl} after ${DOWNLOAD_RETRY_ATTEMPTS} attempts ` +
+				`(${DOWNLOAD_TIMEOUT_MS / 1000}s each). The Space's file route may be overloaded.`
+			: `Failed to download result file ${fileUrl} after ${DOWNLOAD_RETRY_ATTEMPTS} attempts: ${describeError(lastErr)}`,
+		{ itemIndex },
+	);
 }
 
 interface FallbackRun {
