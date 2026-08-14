@@ -1,7 +1,7 @@
 {
   "name": "n8n-nodes-huggingface-space",
   "version": "1.0.4",
-  "description": "Run inference on any Hugging Face Gradio Space from n8n — images, text, video, music, speech, moderation and more, with a curated model catalog and automatic fallbacks.",
+  "description": "Run inference on any Hugging Face Gradio Space from n8n \u2014 images, text, video, music, speech, moderation and more, with a curated model catalog and automatic fallbacks.",
   "keywords": [
     "n8n-community-node-package",
     "n8n",
@@ -33,7 +33,7 @@
     "url": "https://github.com/shadow-software/n8n-nodes-huggingface-space/issues"
   },
   "engines": {
-    "node": ">=20.15"
+    "node": ">=22"
   },
   "main": "index.js",
   "scripts": {
@@ -59,19 +59,19 @@
     ]
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.0.0",
     "@typescript-eslint/eslint-plugin": "^7.18.0",
     "@typescript-eslint/parser": "^7.15.0",
-    "@vitest/coverage-v8": "^3.2.7",
+    "@vitest/coverage-v8": "^4.1.10",
     "eslint": "^8.57.0",
     "eslint-plugin-n8n-nodes-base": "^1.16.3",
     "gulp": "^5.0.0",
     "jsonc-eslint-parser": "^2.4.2",
     "n8n-workflow": "*",
-    "prettier": "^3.3.2",
+    "prettier": "^3.9.6",
     "rimraf": "^5.0.7",
-    "typescript": "^5.5.3",
-    "vitest": "^3.2.7"
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.10"
   },
   "peerDependencies": {
     "n8n-workflow": "*"
