@@ -85,7 +85,7 @@ jobs:
       # this pin is purely about the publishing toolchain.
       - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '26'
           registry-url: 'https://registry.npmjs.org'
           cache: 'npm'
 
