@@ -42,7 +42,7 @@ jobs:
       should_publish: ${{ steps.decide.outputs.should_publish }}
       version: ${{ steps.decide.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2 # need the previous commit to diff the version
       - id: decide
@@ -75,7 +75,7 @@ jobs:
       HAVE_ADMIN_TOKEN: ${{ secrets.NPM_ADMIN_TOKEN != '' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Node 22, NOT 20: npm's Trusted Publishing requires npm >= 11.5.1 and Node >=
       # 22.14.0. Node 20 ships an npm far older than that, and `npm publish` would
@@ -83,7 +83,7 @@ jobs:
       # lint, tests and build had all passed, and only ever visible on a real release.
       # The node itself still SUPPORTS Node 20 at runtime (see CI, which tests both);
       # this pin is purely about the publishing toolchain.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
