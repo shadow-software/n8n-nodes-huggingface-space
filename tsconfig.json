@@ -1,8 +1,8 @@
 {
 	"compilerOptions": {
 		"strict": true,
-		"module": "commonjs",
-		"moduleResolution": "node",
+		"module": "node18",
+		"moduleResolution": "node16",
 		"target": "es2019",
 		"lib": ["es2019", "es2020", "es2022.error", "dom"],
 		"removeComments": true,
@@ -19,6 +19,7 @@
 		"sourceMap": false,
 		"skipLibCheck": true,
 		"outDir": "./dist/",
+		"rootDir": "./",
 		"types": ["node"]
 	},
 	"include": ["credentials/**/*", "nodes/**/*"],
