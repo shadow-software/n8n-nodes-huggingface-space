@@ -1,0 +1,566 @@
+/**
+ * Minimal Gradio client — the wire protocol the Python `gradio_client` speaks,
+ * reimplemented in TypeScript so n8n can call Hugging Face Spaces with no
+ * Python runtime in the (hardened, package-manager-less) n8n image.
+ *
+ * Protocol, verified against live Spaces on 2026-07-13 (gradio 5.39 - 6.20,
+ * all reporting `protocol: "sse_v3"`):
+ *
+ *   1. GET  {host}/config                      -> { api_prefix, dependencies[] }
+ *   2. POST {host}{prefix}/queue/join          -> { event_id }
+ *   3. GET  {host}{prefix}/queue/data?session_hash=...   (SSE)
+ *      ... msg: estimation | process_starts | progress | log | heartbeat ...
+ *      ... msg: process_completed -> { output: { data }, success }
+ *
+ * Two behaviours are load-bearing and were established empirically:
+ *
+ *   - `queue/join` REJECTS a bare `api_name` on gradio 6 ("No function index
+ *     provided"). The numeric `fn_index` is mandatory, so we always resolve
+ *     api_name -> fn_index from /config ourselves. This is precisely the
+ *     bookkeeping the Python client hides.
+ *   - A Space that raises `gr.Error` returns HTTP 200 with an SSE frame of
+ *     `{"success": false, "output": {"error": null}}`. On ZeroGPU Spaces that
+ *     null-message error is what an exhausted anonymous GPU quota looks like.
+ *     It MUST be surfaced as a failure — treating a 200 as success is the exact
+ *     silent-failure class that guardrail #5 in CLAUDE.md exists to prevent.
+ */
+
+export interface GradioDependency {
+	id?: number;
+	api_name?: string | false | null;
+	queue?: boolean | null;
+}
+
+export interface GradioConfig {
+	version?: string;
+	protocol?: string;
+	api_prefix?: string;
+	space_id?: string;
+	dependencies?: GradioDependency[];
+}
+
+export interface GradioEndpointParameter {
+	parameter_name?: string;
+	parameter_has_default?: boolean;
+	parameter_default?: unknown;
+	type?: { type?: string };
+	python_type?: { type?: string };
+	component?: string;
+}
+
+export interface GradioInfo {
+	named_endpoints?: Record<
+		string,
+		{
+			parameters?: GradioEndpointParameter[];
+			returns?: Array<{ label?: string; component?: string; python_type?: { type?: string } }>;
+		}
+	>;
+}
+
+export interface PredictResult {
+	data: unknown[];
+	durationMs: number | null;
+	eventId: string;
+	fnIndex: number;
+	apiName: string;
+	space: string;
+	host: string;
+	logs: string[];
+}
+
+/** Anything that can perform an HTTP request; lets the node inject n8n's helper and tests inject a fake. */
+export type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
+
+/**
+ * Raised when the caller's ZeroGPU allowance is spent.
+ *
+ * This is an *account-level*, time-based limit — not a property of the Space. So
+ * it must NOT be retried against a fallback Space: every other ZeroGPU Space will
+ * reject the same caller identically, and walking the chain just burns wall-clock
+ * to collect the same error N times. Callers should surface it immediately.
+ */
+export class QuotaExceededError extends Error {
+	readonly space: string;
+	constructor(space: string, message: string) {
+		super(message);
+		this.name = 'QuotaExceededError';
+		this.space = space;
+	}
+}
+
+/**
+ * Does this Space failure mean "you are out of GPU quota"?
+ *
+ * Spaces report exhaustion two different ways, both of which arrive as an
+ * HTTP 200 + `success: false`:
+ *   - a plain-text gr.Error: "You have exceeded your free ZeroGPU quota (65s
+ *     requested vs. 81s left). Try again in 23:31:01."
+ *   - a *null* gr.Error, with no message at all — common on the LLM chat Spaces.
+ * The null case is indistinguishable from any other silent Space crash, so we
+ * treat only the explicit message as a definite quota hit.
+ */
+export function isQuotaError(message: string): boolean {
+	return /exceeded your (free )?ZeroGPU quota|GPU quota exceeded|quota.*Try again in/i.test(message);
+}
+
+/**
+ * Turn "owner/space-name" into its default Space host.
+ *   Tongyi-MAI/Z-Image-Turbo            -> tongyi-mai-z-image-turbo.hf.space
+ *   stabilityai/stable-diffusion-3.5-large -> stabilityai-stable-diffusion-3-5-large.hf.space
+ * Note the '.' -> '-' collapse: that is why "3.5" becomes "3-5". Verified live.
+ */
+export function spaceToHost(space: string): string {
+	const trimmed = space.trim();
+	if (/^https?:\/\//i.test(trimmed)) return trimmed.replace(/\/$/, '');
+
+	const slug = trimmed
+		.replace(/[^a-zA-Z0-9]+/g, '-')
+		.replace(/^-+|-+$/g, '')
+		.toLowerCase();
+	if (!slug) throw new Error(`Invalid Space id: "${space}"`);
+	return `https://${slug}.hf.space`;
+}
+
+/**
+ * Resolve an api_name to the numeric fn_index that queue/join demands.
+ * Accepts "/generate" or "generate". Falls back to a numeric string ("2").
+ */
+export function resolveFnIndex(config: GradioConfig, apiName: string): number {
+	const deps = config.dependencies ?? [];
+	const want = apiName.replace(/^\//, '');
+
+	if (/^\d+$/.test(want)) return Number(want);
+
+	for (let i = 0; i < deps.length; i++) {
+		const dep = deps[i];
+		if (dep.api_name && dep.api_name === want) {
+			return typeof dep.id === 'number' ? dep.id : i;
+		}
+	}
+
+	const available = deps
+		.map((d) => d.api_name)
+		.filter((n): n is string => typeof n === 'string' && n.length > 0);
+	throw new Error(
+		`Space has no API endpoint named "/${want}". Available endpoints: ${
+			available.length ? available.map((n) => `/${n}`).join(', ') : '(none exposed)'
+		}`,
+	);
+}
+
+/** Parse an SSE body into individual `data:` JSON frames. */
+export function* parseSseFrames(chunk: string): Generator<Record<string, unknown>> {
+	for (const line of chunk.split('\n')) {
+		const trimmed = line.trimStart();
+		if (!trimmed.startsWith('data:')) continue;
+		const payload = trimmed.slice(5).trim();
+		if (!payload) continue;
+		try {
+			yield JSON.parse(payload) as Record<string, unknown>;
+		} catch {
+			// A frame can be split across chunk boundaries; the caller re-buffers.
+			continue;
+		}
+	}
+}
+
+function authHeaders(token?: string): Record<string, string> {
+	return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** A status worth a quick retry before falling through to the next fallback Space. */
+function isTransientStatus(status: number): boolean {
+	return status === 502 || status === 503 || status === 504;
+}
+
+const CONFIG_INFO_RETRY_ATTEMPTS = 3;
+const CONFIG_INFO_RETRY_DELAY_MS = 500;
+
+/**
+ * Retry a /config or /info fetch a couple of times on a transient 502/503/504
+ * before giving up.
+ *
+ * Without this, a single momentary blip on either read — before any GPU work
+ * has even started — burned the candidate as a permanent failure in
+ * runWithFallbacks() and skipped straight to the next fallback Space, even
+ * though the candidate itself was healthy. 429 is deliberately excluded: it
+ * already carries its own actionable rate-limit message (see
+ * rateLimitMessage()) and retrying it immediately would just trip the limit
+ * again.
+ */
+async function withTransientRetry<T>(fn: () => Promise<T>): Promise<T> {
+	let lastErr: unknown;
+	for (let attempt = 1; attempt <= CONFIG_INFO_RETRY_ATTEMPTS; attempt++) {
+		try {
+			return await fn();
+		} catch (err) {
+			lastErr = err;
+			const status = (err as { status?: number }).status;
+			if (attempt === CONFIG_INFO_RETRY_ATTEMPTS || typeof status !== 'number' || !isTransientStatus(status)) {
+				throw err;
+			}
+			await sleep(CONFIG_INFO_RETRY_DELAY_MS * attempt);
+		}
+	}
+	// Unreachable: the loop above always returns or throws.
+	/* c8 ignore next */
+	throw lastErr;
+}
+
+/**
+ * Rate-limit responses need a distinct message from a generic 5xx: the fix is
+ * "wait" or "add a token", not "the Space is broken." Detected ahead of the
+ * generic !res.ok branches so callers see the more actionable message.
+ */
+function rateLimitMessage(url: string, status: number): string | null {
+	if (status !== 429) return null;
+	return `Rate limited (HTTP 429) calling ${url}. This is a per-caller limit on the Space or Hugging Face's ` +
+		`router, not a broken Space — wait before retrying, or add a Hugging Face token credential to raise the limit.`;
+}
+
+/**
+ * Parse a Response body as JSON, raising a clear error (naming the URL and a
+ * snippet of the actual body) instead of letting an HTML/maintenance page
+ * throw an opaque `SyntaxError` deep inside JSON.parse.
+ */
+async function parseJsonResponse<T>(res: Response, url: string): Promise<T> {
+	const text = await res.text();
+	try {
+		return JSON.parse(text) as T;
+	} catch {
+		throw new Error(
+			`Expected JSON from ${url} but got non-JSON body (HTTP ${res.status}): ${text.slice(0, 300) || '(empty body)'}`,
+		);
+	}
+}
+
+/** Attach the HTTP status to an Error so withTransientRetry() can decide whether to retry it. */
+function withStatus(err: Error, status: number): Error {
+	return Object.assign(err, { status });
+}
+
+export async function fetchConfig(
+	host: string,
+	fetcher: Fetcher,
+	token?: string,
+): Promise<GradioConfig> {
+	const url = `${host}/config`;
+	return withTransientRetry(async () => {
+		const res = await fetcher(url, { headers: authHeaders(token) });
+		if (!res.ok) {
+			throw withStatus(
+				new Error(
+					rateLimitMessage(url, res.status) ??
+						`Could not read Gradio config from ${url} (HTTP ${res.status}). ` +
+							`Is the Space public, awake, and a Gradio Space?`,
+				),
+				res.status,
+			);
+		}
+		return parseJsonResponse<GradioConfig>(res, url);
+	});
+}
+
+export async function fetchInfo(
+	host: string,
+	apiPrefix: string,
+	fetcher: Fetcher,
+	token?: string,
+): Promise<GradioInfo> {
+	const url = `${host}${apiPrefix}/info`;
+	return withTransientRetry(async () => {
+		const res = await fetcher(url, { headers: authHeaders(token) });
+		if (!res.ok) {
+			throw withStatus(
+				new Error(rateLimitMessage(url, res.status) ?? `Could not read API schema from ${url} (HTTP ${res.status})`),
+				res.status,
+			);
+		}
+		return parseJsonResponse<GradioInfo>(res, url);
+	});
+}
+
+/**
+ * Order a parameter object into the positional array Gradio expects, using the
+ * declared schema. Missing params fall back to their declared default. This is
+ * what lets a user pass {prompt: "..."} instead of hand-counting an 8-slot array.
+ */
+export function buildPositionalData(
+	params: GradioEndpointParameter[],
+	provided: Record<string, unknown>,
+): unknown[] {
+	const supplied = new Set(Object.keys(provided));
+	const out = params.map((p) => {
+		const name = p.parameter_name ?? '';
+		if (name && name in provided) {
+			supplied.delete(name);
+			return provided[name];
+		}
+		if (p.parameter_has_default) return p.parameter_default ?? null;
+		return null;
+	});
+
+	if (supplied.size) {
+		const known = params.map((p) => p.parameter_name).filter(Boolean).join(', ');
+		throw new Error(
+			`Unknown parameter(s) for this endpoint: ${[...supplied].join(', ')}. Expected: ${known || '(none)'}`,
+		);
+	}
+	return out;
+}
+
+/**
+ * Extract plain http(s) URLs from Gradio's various FileData shapes.
+ *
+ * Streaming results are DEPRIORITISED rather than dropped. Some Spaces return the
+ * same audio twice: once as an HLS playlist (`is_stream: true`, a .m3u8 whose body is
+ * a 171-byte manifest listing .aac segments) and once as the real file. Seed-VC does
+ * exactly this, and the manifest comes FIRST in the result array — so a naive
+ * "download files[0]" saves a text playlist instead of the 44KB wav. Callers take
+ * files[0], so the real media has to sort ahead of the manifest.
+ */
+export function extractFileUrls(data: unknown): string[] {
+	const direct: string[] = [];
+	const streams: string[] = [];
+	const walk = (node: unknown): void => {
+		if (!node) return;
+		if (Array.isArray(node)) {
+			node.forEach(walk);
+			return;
+		}
+		if (typeof node === 'object') {
+			const obj = node as Record<string, unknown>;
+			if (typeof obj.url === 'string' && /^https?:\/\//.test(obj.url)) {
+				const isStream = obj.is_stream === true || /\.m3u8(\?|$)/i.test(obj.url);
+				(isStream ? streams : direct).push(obj.url);
+			}
+			Object.values(obj).forEach(walk);
+		}
+	};
+	walk(data);
+	return [...direct, ...streams];
+}
+
+export interface PredictOptions {
+	space: string;
+	apiName: string;
+	/** Positional args, already ordered. */
+	data: unknown[];
+	token?: string;
+	fetcher: Fetcher;
+	/** Overall wall-clock budget for the queue wait + generation. */
+	timeoutMs?: number;
+	/** Injected so tests need no real clock. */
+	now?: () => number;
+	sessionHash?: string;
+	/** Pre-fetched config, to avoid a second /config round-trip. */
+	config?: GradioConfig;
+}
+
+export async function predict(opts: PredictOptions): Promise<PredictResult> {
+	const {
+		space,
+		apiName,
+		data,
+		token,
+		fetcher,
+		timeoutMs = 600_000,
+		now = () => Date.now(),
+		sessionHash,
+	} = opts;
+
+	const host = spaceToHost(space);
+	const config = opts.config ?? (await fetchConfig(host, fetcher, token));
+	const prefix = config.api_prefix ?? '';
+	const fnIndex = resolveFnIndex(config, apiName);
+	const session =
+		sessionHash ?? `${now().toString(36)}${Math.random().toString(36).slice(2, 12)}`.slice(0, 24);
+
+	const started = now();
+	const streamTimeout = Symbol('stream_timeout');
+	const timeoutError = (sawActivity = false) => {
+		const activity = sawActivity
+			? 'The Space confirmed it queued this request but did not finish in time.'
+			: 'The Space never confirmed it started processing this request (no estimation/progress frame arrived) — it may be sleeping, unreachable, or the queue itself is stuck.';
+		return new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${space} /${apiName.replace(/^\//, '')}. ${activity} Busy ZeroGPU Spaces can queue for a long time — raise the timeout or supply a Hugging Face token.`);
+	};
+	const withDeadline = async <T>(operation: Promise<T>): Promise<T> => {
+		const remainingMs = Math.max(0, timeoutMs - (now() - started));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([operation, new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(streamTimeout), remainingMs);
+			})]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	};
+
+	const join = await fetcher(`${host}${prefix}/queue/join`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+		body: JSON.stringify({
+			data,
+			fn_index: fnIndex,
+			session_hash: session,
+			trigger_id: null,
+			event_data: null,
+		}),
+	});
+
+	const joinUrl = `${host}${prefix}/queue/join`;
+	if (!join.ok) {
+		const rateLimited = rateLimitMessage(joinUrl, join.status);
+		if (rateLimited) throw new Error(rateLimited);
+		const body = await join.text().catch(() => '');
+		throw new Error(
+			`Gradio queue/join failed (HTTP ${join.status}) for ${space} /${apiName.replace(/^\//, '')}: ` +
+				`${body.slice(0, 300) || '(empty body)'}`,
+		);
+	}
+
+	const joinBody = await parseJsonResponse<{ event_id?: string }>(join, joinUrl);
+	const eventId = joinBody.event_id ?? '';
+
+	const sseUrl = `${host}${prefix}/queue/data?session_hash=${encodeURIComponent(session)}`;
+	const sseController = new AbortController();
+	let sse: Response;
+	try {
+		sse = await withDeadline(fetcher(sseUrl, {
+			headers: { Accept: 'text/event-stream', ...authHeaders(token) },
+			signal: sseController.signal,
+		}));
+	} catch (err) {
+		if (err === streamTimeout) {
+			sseController.abort();
+			throw timeoutError();
+		}
+		throw err;
+	}
+	if (!sse.ok || !sse.body) {
+		const rateLimited = rateLimitMessage(sseUrl, sse.status);
+		throw new Error(rateLimited ?? `Gradio event stream failed (HTTP ${sse.status}) for ${space}`);
+	}
+
+	const reader = (sse.body as ReadableStream<Uint8Array>).getReader();
+	const decoder = new TextDecoder();
+	const logs: string[] = [];
+	let buffer = '';
+	// Did the Space ever confirm it is actually queueing/running this request?
+	// Distinguishes "genuinely slow — it's in the queue" from "silent from the
+	// first byte", which point at very different problems (busy vs. hung/dead).
+	let sawQueueActivity = false;
+	const readWithTimeout = () => withDeadline(reader.read());
+
+	try {
+		for (;;) {
+			if (now() - started > timeoutMs) {
+				const activity = sawQueueActivity
+					? 'The Space confirmed it queued this request but did not finish in time.'
+					: 'The Space never confirmed it started processing this request (no estimation/progress frame arrived) — it may be sleeping, unreachable, or the queue itself is stuck.';
+				throw new Error(
+					`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${space} /${apiName.replace(/^\//, '')}. ` +
+						`${activity} Busy ZeroGPU Spaces can queue for a long time — raise the timeout or supply a Hugging Face token.`,
+				);
+			}
+
+			let readResult: Awaited<ReturnType<typeof reader.read>>;
+			try {
+				readResult = await readWithTimeout();
+			} catch (err) {
+				if (err === streamTimeout) throw timeoutError(sawQueueActivity);
+				throw err;
+			}
+			const { done, value } = readResult;
+			if (done) break;
+
+			buffer += decoder.decode(value, { stream: true });
+			// Keep the trailing partial line in the buffer.
+			const lastNewline = buffer.lastIndexOf('\n');
+			if (lastNewline === -1) continue;
+			const ready = buffer.slice(0, lastNewline);
+			buffer = buffer.slice(lastNewline + 1);
+
+			for (const frame of parseSseFrames(ready)) {
+				const msg = frame.msg as string | undefined;
+
+				if (
+					msg === 'estimation' ||
+					msg === 'process_starts' ||
+					msg === 'progress' ||
+					msg === 'log' ||
+					msg === 'heartbeat'
+				) {
+					sawQueueActivity = true;
+				}
+
+				if (msg === 'log' && typeof frame.log === 'string') {
+					logs.push(frame.log);
+					continue;
+				}
+
+				if (msg === 'unexpected_error') {
+					throw new Error(
+						`Space ${space} returned an unexpected error: ${
+							(frame.message as string) ?? JSON.stringify(frame).slice(0, 300)
+						}`,
+					);
+				}
+
+				if (msg === 'process_completed') {
+					const output = (frame.output ?? {}) as {
+						data?: unknown[];
+						duration?: number;
+						error?: unknown;
+					};
+
+					// HTTP 200 + success:false is how Gradio reports gr.Error. Never
+					// treat this as a result (CLAUDE.md guardrail #5).
+					if (frame.success !== true) {
+						const raw = output.error;
+						const hasMessage = typeof raw === 'string' && raw.trim() !== '';
+						const detail = hasMessage
+							? (raw as string)
+							: 'the Space raised an error with no message. On a ZeroGPU Space this usually means the GPU ' +
+								'quota is exhausted (add a Hugging Face token credential, or wait for the daily reset); ' +
+								'it can also mean the Space itself crashed.';
+						const full = `Space ${space} /${apiName.replace(/^\//, '')} failed: ${detail}`;
+						if (hasMessage && isQuotaError(raw as string)) {
+							throw new QuotaExceededError(space, full);
+						}
+						throw new Error(full);
+					}
+
+					return {
+						data: output.data ?? [],
+						durationMs: typeof output.duration === 'number' ? Math.round(output.duration * 1000) : null,
+						eventId,
+						fnIndex,
+						apiName: apiName.replace(/^\//, ''),
+						space,
+						host,
+						logs,
+					};
+				}
+
+				if (msg === 'close_stream') {
+					throw new Error(
+						`Space ${space} closed the event stream before returning a result. ` +
+							`The Space may have crashed or restarted mid-request.`,
+					);
+				}
+			}
+		}
+	} finally {
+		await reader.cancel().catch(() => undefined);
+	}
+
+	throw new Error(
+		`Event stream for ${space} ended without a result. The Space may be sleeping, restarting, or overloaded.`,
+	);
+}

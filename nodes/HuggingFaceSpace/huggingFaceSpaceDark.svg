@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60" role="img" aria-label="Hugging Face Space by Shadow Software">
+  <title>Hugging Face Space</title>
+
+  <defs>
+    <linearGradient id="hfsSparkDark" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8fd468"/>
+      <stop offset="55%" stop-color="#5aa63c"/>
+      <stop offset="100%" stop-color="#3f7a2a"/>
+    </linearGradient>
+  </defs>
+
+  <path d="M30 2.5 53 15.75v26.5L30 55.5 7 42.25v-26.5z"
+        fill="#f6f8fb" stroke="#4e8f2e" stroke-width="2.8" stroke-linejoin="round"/>
+
+  <g fill="#1f2933">
+    <rect x="14.5" y="24" width="13" height="3.4" rx="1.7"/>
+    <rect x="14.5" y="32" width="8.5" height="3.4" rx="1.7" opacity="0.6"/>
+  </g>
+
+  <path d="M39.5 16.5c1.75 8.6 3.35 10.2 11.95 11.95C42.85 30.2 41.25 31.8 39.5 40.4c-1.75-8.6-3.35-10.2-11.95-11.95 8.6-1.75 10.2-3.35 11.95-11.95z"
+        fill="url(#hfsSparkDark)"/>
+</svg>
